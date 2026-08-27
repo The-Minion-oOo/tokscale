@@ -9366,6 +9366,185 @@ mod tests {
         }
     }
 
+    /// Build a `message` table with the columns a modern OpenCode database has.
+    fn create_timed_opencode_db(db_path: &std::path::Path) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (
+                 id TEXT PRIMARY KEY,
+                 directory TEXT NOT NULL,
+                 title TEXT
+             );
+             CREATE TABLE message (
+                 id TEXT PRIMARY KEY,
+                 session_id TEXT NOT NULL,
+                 time_created INTEGER NOT NULL,
+                 time_updated INTEGER NOT NULL,
+                 data TEXT NOT NULL
+             );
+             INSERT INTO session (id, directory, title)
+             VALUES ('session-1', '/tmp/project', 'A session');",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn timed_opencode_payload(id: &str, output: i64) -> String {
+        format!(
+            r#"{{
+                "id": "{id}",
+                "role": "assistant",
+                "modelID": "claude-sonnet-4",
+                "providerID": "anthropic",
+                "tokens": {{ "input": 100, "output": {output}, "reasoning": 0, "cache": {{ "read": 0, "write": 0 }} }},
+                "time": {{ "created": 1700000000000.0 }}
+            }}"#
+        )
+    }
+
+    fn insert_timed_opencode_row(conn: &rusqlite::Connection, id: &str, created: i64, output: i64) {
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data)
+             VALUES (?1, 'session-1', ?2, ?2, ?3)",
+            rusqlite::params![id, created, timed_opencode_payload(id, output)],
+        )
+        .unwrap();
+    }
+
+    fn total_output_tokens(messages: &[UnifiedMessage]) -> i64 {
+        messages.iter().map(|message| message.tokens.output).sum()
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_opencode_warm_scan_reads_only_changed_rows_and_agrees_with_a_cold_parse() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+
+        let db_dir = source_home.path().join(".local/share/opencode");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let db_path = db_dir.join("opencode.db");
+        let conn = create_timed_opencode_db(&db_path);
+        insert_timed_opencode_row(&conn, "msg-aaa", 1_000, 50);
+        insert_timed_opencode_row(&conn, "msg-zzz", 2_000, 60);
+
+        let cold = parse_all_messages_with_pricing(
+            source_home.path().to_str().unwrap(),
+            &["opencode".to_string()],
+            None,
+        );
+        assert_eq!(cold.len(), 2);
+        assert_eq!(total_output_tokens(&cold), 110);
+
+        let entry = message_cache::SourceMessageCache::load()
+            .get(
+                message_cache::CacheIdentity::for_client(ClientId::OpenCode),
+                &db_path,
+            )
+            .expect("the cold parse caches the database");
+        assert!(
+            entry.opencode_incremental.is_some(),
+            "a cold parse has to leave the mark a warm scan resumes from"
+        );
+
+        // The oldest row, first by id, is rewritten long after it was
+        // inserted -- the case an id-keyed mark would skip -- and a newer row
+        // arrives alongside it.
+        conn.execute(
+            "UPDATE message SET data = ?2, time_updated = ?3 WHERE id = ?1",
+            rusqlite::params!["msg-aaa", timed_opencode_payload("msg-aaa", 500), 9_000],
+        )
+        .unwrap();
+        insert_timed_opencode_row(&conn, "msg-mmm", 9_500, 70);
+
+        let rescans_before = sessions::opencode_schema::INCREMENTAL_RESCANS
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let warm = parse_all_messages_with_pricing(
+            source_home.path().to_str().unwrap(),
+            &["opencode".to_string()],
+            None,
+        );
+        assert_eq!(
+            sessions::opencode_schema::INCREMENTAL_RESCANS
+                .load(std::sync::atomic::Ordering::Relaxed),
+            rescans_before + 1,
+            "the warm scan must take the incremental path, not re-parse everything"
+        );
+        assert_eq!(warm.len(), 3);
+        assert_eq!(
+            total_output_tokens(&warm),
+            630,
+            "the rewritten row must be counted at its new value, once"
+        );
+
+        // Same database state, empty cache: the two paths have to agree.
+        let fresh_cache_home = tempfile::TempDir::new().unwrap();
+        let _fresh_cache_env = redirect_cache_home(fresh_cache_home.path());
+        let recold = parse_all_messages_with_pricing(
+            source_home.path().to_str().unwrap(),
+            &["opencode".to_string()],
+            None,
+        );
+        let mut warm_keys: Vec<Option<String>> = warm
+            .iter()
+            .map(|message| message.dedup_key.clone())
+            .collect();
+        let mut cold_keys: Vec<Option<String>> = recold
+            .iter()
+            .map(|message| message.dedup_key.clone())
+            .collect();
+        warm_keys.sort();
+        cold_keys.sort();
+        assert_eq!(warm_keys, cold_keys);
+        assert_eq!(total_output_tokens(&warm), total_output_tokens(&recold));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_opencode_warm_scan_re_parses_after_a_row_is_deleted() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+
+        let db_dir = source_home.path().join(".local/share/opencode");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let db_path = db_dir.join("opencode.db");
+        let conn = create_timed_opencode_db(&db_path);
+        insert_timed_opencode_row(&conn, "msg-aaa", 1_000, 50);
+        insert_timed_opencode_row(&conn, "msg-zzz", 2_000, 60);
+
+        let cold = parse_all_messages_with_pricing(
+            source_home.path().to_str().unwrap(),
+            &["opencode".to_string()],
+            None,
+        );
+        assert_eq!(cold.len(), 2);
+
+        // OpenCode cascades a session delete onto its messages. An incremental
+        // scan cannot see the row that went away, so the guard has to force a
+        // full re-parse rather than keep counting it.
+        conn.execute("DELETE FROM message WHERE id = 'msg-zzz'", [])
+            .unwrap();
+
+        let rescans_before = sessions::opencode_schema::INCREMENTAL_RESCANS
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let warm = parse_all_messages_with_pricing(
+            source_home.path().to_str().unwrap(),
+            &["opencode".to_string()],
+            None,
+        );
+        assert_eq!(
+            sessions::opencode_schema::INCREMENTAL_RESCANS
+                .load(std::sync::atomic::Ordering::Relaxed),
+            rescans_before,
+            "a deletion must not be served by an incremental scan"
+        );
+        assert_eq!(warm.len(), 1);
+        assert_eq!(warm[0].dedup_key.as_deref(), Some("msg-aaa"));
+        assert_eq!(total_output_tokens(&warm), 50);
+    }
+
     #[test]
     #[serial_test::serial]
     fn test_sqlite_source_cache_invalidates_on_wal_change() {

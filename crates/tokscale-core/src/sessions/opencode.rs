@@ -12,7 +12,7 @@
 // The message payload type and the SQLite driver are shared with every other
 // client that adopted OpenCode's schema.
 use super::opencode_schema::{
-    parse_opencode_schema_sqlite, rescan_opencode_schema_sqlite, reported_cost,
+    parse_opencode_schema_sqlite, reported_cost, rescan_opencode_schema_sqlite,
     scan_opencode_schema_sqlite, set_workspace_from_root, OpenCodeIncrementalState,
     OpenCodeSchemaConfig, OpenCodeSchemaMessage as OpenCodeMessage, OpenCodeSchemaScan,
 };
@@ -1949,7 +1949,8 @@ mod tests {
         // OpenCode cascades a session delete onto its messages; the row is
         // simply gone, and no incremental query can report its absence.
         let conn = Connection::open(&db_path).unwrap();
-        conn.execute("DELETE FROM message WHERE id = 'msg_b'", []).unwrap();
+        conn.execute("DELETE FROM message WHERE id = 'msg_b'", [])
+            .unwrap();
         drop(conn);
 
         assert!(
@@ -1977,7 +1978,8 @@ mod tests {
         let state = cold.incremental.clone().unwrap();
 
         let conn = Connection::open(&db_path).unwrap();
-        conn.execute("DELETE FROM message WHERE id = 'msg_b'", []).unwrap();
+        conn.execute("DELETE FROM message WHERE id = 'msg_b'", [])
+            .unwrap();
         insert_timed_v1_message(&conn, "msg_c", 9_500, 33);
         drop(conn);
 
@@ -2086,5 +2088,4 @@ mod integration_tests {
             "Expected to parse some messages from SQLite"
         );
     }
-
 }

@@ -994,13 +994,8 @@ fn collect_rows_since(
     since: i64,
     on_row: &mut dyn FnMut(OpenCodeSchemaRow),
 ) -> bool {
-    let scan = sqlite_for_each_row_on_with_params(
-        conn,
-        db_path,
-        query,
-        &[&since],
-        None,
-        &mut |row| {
+    let scan =
+        sqlite_for_each_row_on_with_params(conn, db_path, query, &[&since], None, &mut |row| {
             let id: String = row.get(0)?;
             let session_id: String = row.get(1)?;
             let data_json: String = row.get(2)?;
@@ -1008,8 +1003,7 @@ fn collect_rows_since(
             let session_title: Option<String> = row.get(4)?;
             on_row((id, session_id, data_json, workspace_root, session_title));
             Ok(())
-        },
-    );
+        });
     scan.prepared()
 }
 
@@ -1057,6 +1051,12 @@ pub(crate) struct OpenCodeGroupMark {
 pub(crate) struct OpenCodeIncrementalState {
     pub groups: Vec<Option<OpenCodeGroupMark>>,
 }
+
+/// Counts the rescans that stayed incremental, so a test can tell an
+/// incremental scan apart from a full re-parse that happened to agree with it.
+#[cfg(test)]
+pub(crate) static INCREMENTAL_RESCANS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// A scan's messages plus the state a later scan needs to resume from it.
 pub(crate) struct OpenCodeSchemaScan {
@@ -1275,13 +1275,9 @@ pub(crate) fn rescan_opencode_schema_sqlite(
         }
 
         let query = incremental.queries.get(chosen)?;
-        if !collect_rows_since(
-            db_path,
-            &conn,
-            query,
-            mark.updated_high_water,
-            &mut |row| acc.ingest(row, &cfg, &db_namespace),
-        ) {
+        if !collect_rows_since(db_path, &conn, query, mark.updated_high_water, &mut |row| {
+            acc.ingest(row, &cfg, &db_namespace)
+        }) {
             return None;
         }
 
@@ -1293,8 +1289,11 @@ pub(crate) fn rescan_opencode_schema_sqlite(
         }));
     }
 
+    let messages = merge_incremental_messages(cached_messages, acc.messages)?;
+    #[cfg(test)]
+    INCREMENTAL_RESCANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Some(OpenCodeSchemaScan {
-        messages: merge_incremental_messages(cached_messages, acc.messages)?,
+        messages,
         incremental: Some(OpenCodeIncrementalState { groups: marks }),
     })
 }

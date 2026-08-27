@@ -4450,6 +4450,64 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn test_v5_shard_migrates_messages_without_an_incremental_mark() {
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let source = write_temp_file(b"{}\n");
+        let identity = CacheIdentity::for_client(ClientId::OpenCode);
+        let entry = test_entry(identity, source.path(), "legacy-opencode");
+        let key = CacheKey::from_entry(&entry);
+        let shard_key = key.shard();
+        let legacy_path = shard_path(&cache_shard_dir().unwrap(), &shard_key);
+        ensure_cache_dir(legacy_path.parent().unwrap()).unwrap();
+        let legacy_entry = LegacyCachedSourceEntryV5 {
+            parser_namespace: entry.parser_namespace,
+            parser_version: entry.parser_version,
+            path: entry.path,
+            fingerprint: entry.fingerprint,
+            messages: entry.messages,
+            fallback_timestamp_indices: entry.fallback_timestamp_indices,
+            codex_incremental: entry.codex_incremental,
+            prime_accounting: entry.prime_accounting,
+        };
+        let envelope = CachedShardEnvelope {
+            format_version: LEGACY_CACHE_FORMAT_VERSION_V5,
+            parser_namespace: identity.namespace.to_string(),
+            parser_version: identity.parser_version,
+            payload: bincode::options().serialize(&vec![legacy_entry]).unwrap(),
+        };
+        let mut writer = BufWriter::new(File::create(&legacy_path).unwrap());
+        bincode::options()
+            .serialize_into(&mut writer, &envelope)
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        // An entry written before the mark existed keeps its messages and
+        // takes one full parse to acquire one, rather than being discarded.
+        assert!(matches!(
+            read_shard(&legacy_path, identity),
+            ShardReadStatus::Migrated(entries)
+                if entries.len() == 1
+                    && entries[0].messages[0].session_id == "legacy-opencode"
+                    && entries[0].opencode_incremental.is_none()
+        ));
+
+        let mut cache = SourceMessageCache::load();
+        assert_eq!(
+            cache.get(identity, source.path()).unwrap().messages[0].session_id,
+            "legacy-opencode"
+        );
+        assert!(cache.has_rewrite_shard(&shard_key));
+        cache.save_if_dirty();
+        assert!(matches!(
+            read_shard(&legacy_path, identity),
+            ShardReadStatus::Loaded(entries) if entries.len() == 1
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn test_v4_shard_migrates_messages_and_rewrites_once() {
         let temp_home = TempDir::new().unwrap();
         let _cache_env = sandbox_cache_env(temp_home.path());
