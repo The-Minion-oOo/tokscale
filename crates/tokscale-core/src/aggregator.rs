@@ -40,21 +40,48 @@ pub fn aggregate_by_date(messages: Vec<UnifiedMessage>) -> Vec<DailyContribution
             },
         );
 
-    // Convert to sorted vector with pre-allocated capacity
-    let mut contributions: Vec<DailyContribution> = Vec::with_capacity(daily_map.len());
-    contributions.extend(
-        daily_map
-            .into_iter()
-            .map(|(date, acc)| acc.into_contribution(date)),
-    );
+    DailyFold { days: daily_map }.finish()
+}
 
-    // Sort by date
-    contributions.sort_by(|a, b| a.date.cmp(&b.date));
+/// Incremental form of [`aggregate_by_date`].
+///
+/// [`aggregate_by_date`] takes a `Vec<UnifiedMessage>`, which means the caller
+/// has already paid to materialize every message. Callers that receive
+/// messages one at a time can fold each one in and drop it immediately, so
+/// peak memory is the day map (a few hundred entries) rather than the corpus.
+///
+/// [`aggregate_by_date`] delegates its own tail here, so both paths produce
+/// byte-identical contributions.
+#[derive(Default)]
+pub struct DailyFold {
+    days: HashMap<String, DayAccumulator>,
+}
 
-    // Calculate intensities based on max cost
-    calculate_intensities(&mut contributions);
+impl DailyFold {
+    pub fn add(&mut self, message: &UnifiedMessage) {
+        self.days
+            .entry(message.date.clone())
+            .or_default()
+            .add_message(message);
+    }
 
-    contributions
+    pub fn finish(self) -> Vec<DailyContribution> {
+        // Convert to sorted vector with pre-allocated capacity
+        let mut contributions: Vec<DailyContribution> = Vec::with_capacity(self.days.len());
+        contributions.extend(
+            self.days
+                .into_iter()
+                .map(|(date, acc)| acc.into_contribution(date)),
+        );
+
+        // Sort by date
+        contributions.sort_by(|a, b| a.date.cmp(&b.date));
+
+        // Calculate intensities based on max cost
+        calculate_intensities(&mut contributions);
+
+        contributions
+    }
 }
 
 /// Aggregate messages into per-session contributions, keyed on `session_id`.
