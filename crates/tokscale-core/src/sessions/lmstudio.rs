@@ -1,7 +1,8 @@
 //! LM Studio local-server usage parser.
 //!
 //! The OpenAI-compatible server writes pretty-printed final responses beneath
-//! `~/.lmstudio/server-logs/`. This parser extracts only the response identity,
+//! `~/.lmstudio/server-logs/`. This parser supports both Chat Completions and
+//! Responses API usage shapes while extracting only the response identity,
 //! model, local timestamp, and balanced `usage` object. Prompt and response
 //! bodies are neither deserialized nor retained.
 
@@ -24,19 +25,44 @@ struct PromptTokenDetails {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct OutputTokenDetails {
+    #[serde(default)]
+    reasoning_tokens: i64,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct UsagePayload {
-    #[serde(default, alias = "promptTokens")]
+    #[serde(
+        default,
+        alias = "promptTokens",
+        alias = "input_tokens",
+        alias = "inputTokens"
+    )]
     prompt_tokens: i64,
-    #[serde(default, alias = "completionTokens")]
+    #[serde(
+        default,
+        alias = "completionTokens",
+        alias = "output_tokens",
+        alias = "outputTokens"
+    )]
     completion_tokens: i64,
     #[serde(default, alias = "totalTokens")]
     total_tokens: i64,
-    #[serde(default)]
+    #[serde(default, alias = "input_tokens_details", alias = "inputTokensDetails")]
     prompt_tokens_details: PromptTokenDetails,
+    #[serde(
+        default,
+        alias = "completion_tokens_details",
+        alias = "completionTokensDetails",
+        alias = "outputTokensDetails"
+    )]
+    output_tokens_details: OutputTokenDetails,
     #[serde(default)]
     cached_tokens: i64,
     #[serde(default)]
     cache_creation_input_tokens: i64,
+    #[serde(default)]
+    reasoning_tokens: i64,
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
@@ -198,6 +224,13 @@ fn normalized_tokens(usage: &UsagePayload) -> Option<TokenBreakdown> {
             .max(usage.cache_creation_input_tokens),
     )
     .min(prompt.saturating_sub(cache_read));
+    let reasoning = non_negative(
+        usage
+            .output_tokens_details
+            .reasoning_tokens
+            .max(usage.reasoning_tokens),
+    )
+    .min(output);
     let total = non_negative(usage.total_tokens).max(prompt.saturating_add(output));
     if total == 0 {
         return None;
@@ -208,10 +241,10 @@ fn normalized_tokens(usage: &UsagePayload) -> Option<TokenBreakdown> {
         .saturating_sub(cache_write);
     Some(TokenBreakdown {
         input,
-        output,
+        output: output.saturating_sub(reasoning),
         cache_read,
         cache_write,
-        reasoning: 0,
+        reasoning,
     })
 }
 
@@ -262,8 +295,11 @@ pub fn parse_lmstudio_file(path: &Path) -> Vec<UnifiedMessage> {
             continue;
         };
         let metadata = &bytes[metadata_start..marker];
-        let response_id =
-            last_json_string_field(metadata, b"id").filter(|value| value.starts_with("chatcmpl-"));
+        let response_id = last_json_string_field(metadata, b"id").filter(|value| {
+            ["chatcmpl-", "cmpl-", "resp_"]
+                .iter()
+                .any(|prefix| value.starts_with(prefix))
+        });
         let model = last_json_string_field(metadata, b"model")
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "unknown".to_string());
@@ -367,6 +403,43 @@ Final response: {{
                 .map(|message| message.tokens.total())
                 .sum::<i64>(),
             20
+        );
+    }
+
+    #[test]
+    fn parses_responses_api_usage_without_double_counting_reasoning() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[2026-07-09 11:30:00][INFO][responses-model]\n{}",
+            serde_json::json!({
+                "id": "resp_fixture",
+                "model": "responses-model",
+                "output": [{"type": "reasoning"}, {"type": "message"}],
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 40,
+                    "total_tokens": 140,
+                    "input_tokens_details": {"cached_tokens": 30},
+                    "output_tokens_details": {"reasoning_tokens": 10}
+                }
+            })
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let messages = parse_lmstudio_file(file.path());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].model_id, "responses-model");
+        assert_eq!(messages[0].tokens.input, 70);
+        assert_eq!(messages[0].tokens.output, 30);
+        assert_eq!(messages[0].tokens.cache_read, 30);
+        assert_eq!(messages[0].tokens.cache_write, 0);
+        assert_eq!(messages[0].tokens.reasoning, 10);
+        assert_eq!(messages[0].tokens.total(), 140);
+        assert_eq!(
+            messages[0].dedup_key.as_deref(),
+            Some("lmstudio:resp_fixture")
         );
     }
 
