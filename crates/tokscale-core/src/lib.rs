@@ -763,6 +763,23 @@ fn parse_all_messages_with_pricing_with_env_strategy(
     )
 }
 
+/// True when a legacy OpenCode JSON file has already been read out of SQLite.
+///
+/// OpenCode 1.2+ migrated `storage/message/<session>/<message id>.json` into
+/// the `message` table, but it leaves the JSON tree in place afterwards. Both
+/// lanes are scanned and the SQLite lane runs first, so every migrated file is
+/// parsed only for its message to be dropped by the dedup filter that follows.
+///
+/// The file stem is the message id, which is exactly the dedup key the SQLite
+/// lane inserted, so the duplicate can be recognized from the path alone —
+/// before the file is opened. On a migrated install that skips nearly the whole
+/// directory (#1209); unmigrated files miss the set and are still parsed.
+fn opencode_json_superseded_by_sqlite(path: &Path, sqlite_keys: &HashSet<String>) -> bool {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| sqlite_keys.contains(stem))
+}
+
 fn parse_all_messages_with_pricing_with_cache_policy(
     home_dir: &str,
     clients: &[String],
@@ -1665,6 +1682,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
     let opencode_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::OpenCode)
         .par_iter()
+        .filter(|path| !opencode_json_superseded_by_sqlite(path, &opencode_seen))
         .filter_map(|path| {
             Some(load_or_parse_source(
                 message_cache::CacheIdentity::for_client(ClientId::OpenCode),
@@ -4399,6 +4417,7 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
         let json_msgs: Vec<(String, ParsedMessage)> = scan_result
             .get(ClientId::OpenCode)
             .par_iter()
+            .filter(|path| !opencode_json_superseded_by_sqlite(path, &seen))
             .filter_map(|path| {
                 let msg = sessions::opencode::parse_opencode_file(path)?;
                 let key = msg.dedup_key.clone().unwrap_or_default();
@@ -5447,7 +5466,7 @@ mod tests {
         dedupe_latest_trae_messages, filter_messages_for_report,
         generate_graph_with_loaded_pricing, get_home_dir_string, is_generic_routing_label,
         merge_claude_cross_file_duplicate, message_cache, normalize_model_for_grouping,
-        parse_all_messages_with_pricing_with_cache_policy,
+        opencode_json_superseded_by_sqlite, parse_all_messages_with_pricing_with_cache_policy,
         parse_all_messages_with_pricing_with_env_strategy, parse_local_clients, parsed_to_unified,
         paths, pricing, retain_for_requested_clients, scanner, select_local_parse_pricing,
         sessions, unified_to_parsed, validate_priced_messages, ClientId, GraphPricingRequirement,
@@ -9586,6 +9605,139 @@ mod tests {
             assert_eq!(parsed.messages.iter().map(|m| m.input).sum::<i64>(), 600);
             assert_eq!(parsed.messages.iter().map(|m| m.output).sum::<i64>(), 250);
         }
+    }
+
+    #[test]
+    fn test_opencode_json_superseded_by_sqlite_matches_on_message_id() {
+        let mut sqlite_keys: HashSet<String> = HashSet::new();
+        sqlite_keys.insert("msg_migrated".to_string());
+
+        // The legacy file is named after the message id the migration copied
+        // into SQLite, so the duplicate is recognizable from the path alone.
+        assert!(opencode_json_superseded_by_sqlite(
+            std::path::Path::new("/s/storage/message/ses_1/msg_migrated.json"),
+            &sqlite_keys
+        ));
+
+        // A file the migration never reached has no row to shadow it.
+        assert!(!opencode_json_superseded_by_sqlite(
+            std::path::Path::new("/s/storage/message/ses_1/msg_unmigrated.json"),
+            &sqlite_keys
+        ));
+
+        // Without any SQLite db every file has to be read.
+        assert!(!opencode_json_superseded_by_sqlite(
+            std::path::Path::new("/s/storage/message/ses_1/msg_migrated.json"),
+            &HashSet::new()
+        ));
+
+        // Only the stem participates: the session directory is not a message id.
+        assert!(!opencode_json_superseded_by_sqlite(
+            std::path::Path::new("/s/storage/message/msg_migrated/other.json"),
+            &sqlite_keys
+        ));
+    }
+
+    /// Writes an opencode install whose SQLite db holds `migrated`, alongside a
+    /// legacy JSON tree holding the same message plus one the migration never
+    /// reached. Returns (migrated tokens, unmigrated tokens) as (input, output).
+    fn write_opencode_partially_migrated_fixture(source_home: &std::path::Path) {
+        let db_dir = source_home.join(".local/share/opencode");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let conn = create_opencode_sqlite_db(&db_dir.join("opencode.db"));
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                "msg_migrated",
+                "ses_1",
+                build_opencode_sqlite_payload(
+                    1_700_000_000_000.0,
+                    1_700_000_000_500.0,
+                    100,
+                    50,
+                    0,
+                    10,
+                    5,
+                    0.01,
+                )
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let message_dir = source_home.join(".local/share/opencode/storage/message/ses_1");
+        std::fs::create_dir_all(&message_dir).unwrap();
+
+        // Left behind by the migration: the same message the db already has.
+        std::fs::write(
+            message_dir.join("msg_migrated.json"),
+            r#"{"id":"msg_migrated","sessionID":"ses_1","role":"assistant","modelID":"claude-sonnet-4","providerID":"anthropic","cost":0.01,"tokens":{"input":100,"output":50,"reasoning":0,"cache":{"read":10,"write":5}},"time":{"created":1700000000000}}"#,
+        )
+        .unwrap();
+
+        // Never migrated, so this one is only available as JSON.
+        std::fs::write(
+            message_dir.join("msg_unmigrated.json"),
+            r#"{"id":"msg_unmigrated","sessionID":"ses_1","role":"assistant","modelID":"claude-sonnet-4","providerID":"anthropic","cost":0.02,"tokens":{"input":7,"output":3,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1700000001000}}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_parse_all_messages_keeps_unmigrated_opencode_json_when_skipping_migrated() {
+        // Skipping migrated legacy files (#1209) must not drop the ones the
+        // migration never reached: the db copy and the JSON-only copy both
+        // have to survive, exactly once each.
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+
+        write_opencode_partially_migrated_fixture(source_home.path());
+
+        let messages = parse_all_messages_with_pricing(
+            source_home.path().to_str().unwrap(),
+            &["opencode".to_string()],
+            None,
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.iter().map(|m| m.tokens.input).sum::<i64>(), 107);
+        assert_eq!(messages.iter().map(|m| m.tokens.output).sum::<i64>(), 53);
+        assert!(messages
+            .iter()
+            .any(|m| m.dedup_key.as_deref() == Some("msg_migrated")));
+        assert!(messages
+            .iter()
+            .any(|m| m.dedup_key.as_deref() == Some("msg_unmigrated")));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_parse_local_clients_keeps_unmigrated_opencode_json_when_skipping_migrated() {
+        // Same guard for the counting lane, which filters legacy paths against
+        // its own `seen` set.
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+
+        write_opencode_partially_migrated_fixture(source_home.path());
+
+        let parsed = parse_local_clients(LocalParseOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["opencode".to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings::default(),
+        })
+        .unwrap();
+
+        assert_eq!(parsed.counts.get(ClientId::OpenCode), 2);
+        assert_eq!(parsed.messages.len(), 2);
+        assert_eq!(parsed.messages.iter().map(|m| m.input).sum::<i64>(), 107);
+        assert_eq!(parsed.messages.iter().map(|m| m.output).sum::<i64>(), 53);
     }
 
     fn write_codex_forked_history_fixture(source_home: &std::path::Path) {
