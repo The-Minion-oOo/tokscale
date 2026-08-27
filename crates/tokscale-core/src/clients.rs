@@ -1003,6 +1003,24 @@ define_clients!(
         headless: false,
         parse_local: true,
         submit_default: true
+    },
+    // LM Studio's OpenAI-compatible local server writes final response usage
+    // blocks to nested monthly logs. The parser reads only the response id,
+    // model, timestamp and usage object; prompt and response bodies are never
+    // retained. Local inference has an authoritative zero monetary cost.
+    LmStudio = 50 => {
+        id: "lmstudio",
+        display: "LM Studio",
+        logo: Some("https://github.com/lmstudio-ai.png"),
+        root: PathRoot::EnvVar {
+            var: "LM_STUDIO_HOME",
+            fallback_relative: ".lmstudio",
+        },
+        relative: "server-logs",
+        pattern: "*.log",
+        headless: false,
+        parse_local: true,
+        submit_default: true
     }
 );
 
@@ -1118,7 +1136,7 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 50);
+        assert_eq!(ClientId::COUNT, 51);
     }
 
     #[test]
@@ -1717,6 +1735,30 @@ mod tests {
             native_join(std::path::Path::new("/tmp/home"), ".junie/sessions")
         );
         assert_eq!(client.data().pattern, "events.jsonl");
+        assert!(client.data().parse_local);
+        assert!(client.data().submit_default);
+        assert!(!client.data().headless);
+    }
+
+    #[test]
+    #[serial]
+    fn test_lmstudio_client_registered_with_home_override() {
+        let mut env = EnvGuard::capture(&["LM_STUDIO_HOME"]);
+        env.set("LM_STUDIO_HOME", "/custom/lm-studio");
+
+        let client = ClientId::from_str("lmstudio").expect("LM Studio should be registered");
+        assert_eq!(client.display_name(), "LM Studio");
+        assert_eq!(
+            client.data().resolve_path("/tmp/home"),
+            native_join(std::path::Path::new("/custom/lm-studio"), "server-logs")
+        );
+        assert_eq!(
+            client
+                .data()
+                .resolve_path_with_env_strategy("/tmp/home", false),
+            native_join(std::path::Path::new("/tmp/home"), ".lmstudio/server-logs")
+        );
+        assert_eq!(client.data().pattern, "*.log");
         assert!(client.data().parse_local);
         assert!(client.data().submit_default);
         assert!(!client.data().headless);

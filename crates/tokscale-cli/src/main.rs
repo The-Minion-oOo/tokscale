@@ -1095,6 +1095,7 @@ pub enum ClientFilter {
     Mcode,
     Fx,
     Omp,
+    LmStudio,
     Synthetic,
 }
 
@@ -1155,6 +1156,7 @@ impl ClientFilter {
             Self::Mcode => "mcode",
             Self::Fx => "fx",
             Self::Omp => "omp",
+            Self::LmStudio => "lmstudio",
             Self::Synthetic => "synthetic",
         }
     }
@@ -1218,6 +1220,7 @@ impl ClientFilter {
             Self::Mcode => Some(ClientId::Mcode),
             Self::Fx => Some(ClientId::Fx),
             Self::Omp => Some(ClientId::Omp),
+            Self::LmStudio => Some(ClientId::LmStudio),
             Self::Synthetic => None,
         }
     }
@@ -1277,6 +1280,7 @@ impl ClientFilter {
             ClientId::Mcode => Self::Mcode,
             ClientId::Fx => Self::Fx,
             ClientId::Omp => Self::Omp,
+            ClientId::LmStudio => Self::LmStudio,
         }
     }
 

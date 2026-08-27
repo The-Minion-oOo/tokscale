@@ -51,6 +51,7 @@ export const SUPPORTED_CLIENT_TYPES = [
   "dsh",
   "fx",
   "omp",
+  "lmstudio",
 ] as const;
 
 export type CcMirrorClientType = `cc-mirror/${string}`;

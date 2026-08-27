@@ -2598,6 +2598,32 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn test_scan_all_clients_discovers_nested_lmstudio_logs() {
+        let mut env = EnvGuard::capture(&["LM_STUDIO_HOME"]);
+        env.remove("LM_STUDIO_HOME");
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let monthly_logs = home.join(".lmstudio/server-logs/2026-07");
+        fs::create_dir_all(&monthly_logs).unwrap();
+        let expected = monthly_logs.join("2026-07-09.log");
+        File::create(&expected).unwrap();
+        File::create(monthly_logs.join("ignore.txt")).unwrap();
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["lmstudio".to_string()],
+            false,
+        );
+
+        assert_eq!(
+            result.get(ClientId::LmStudio).as_slice(),
+            std::slice::from_ref(&expected)
+        );
+        assert_eq!(result.total_files(), 1);
+    }
+
+    #[test]
     fn test_scan_directory_workbuddy_db_pattern() {
         let dir = TempDir::new().unwrap();
         let path = dir.path();

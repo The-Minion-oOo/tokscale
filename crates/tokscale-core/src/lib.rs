@@ -1250,24 +1250,14 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         }
     }
 
-    /// Same as [`parse_cached_lane`], for a client whose transcripts can repeat
-    /// one another's rows verbatim.
+    /// Same as [`parse_cached_lane`], for a client whose source files can repeat
+    /// the same event.
     ///
-    /// A DSH fork seeds the child transcript with the parent's completed prefix
-    /// — same `message.id`, time and usage, under a different session id — so
-    /// the per-source cache alone cannot collapse the copy. Dedup keys survive
-    /// a warm cache hit, so the pass behaves identically cold and warm.
-    ///
-    /// Ownership, and what this pass does not decide: when the child header
-    /// carries `seedLength` the parser drops the seeded rows at the source, so
-    /// the parent's copy survives whatever order the scan hands the files over
-    /// in. This pass is the fallback for a header that lost the field, which
-    /// DSH's own readers treat as an unseeded log (`header.seedLength ?? 0` in
-    /// `core/agent/src/inbox.ts` and `schedule/src/invariant.ts`) — nothing in
-    /// the transcript then marks the prefix as inherited. It degrades to
-    /// first-wins in scan-path order: totals and per-model rollups stay
-    /// correct, and only the session label on the surviving row depends on
-    /// which transcript sorts first.
+    /// Parsers using this lane must provide globally stable dedup keys. Those
+    /// keys survive a warm cache hit, so duplicate handling behaves identically
+    /// on cold and warm scans. The pass is first-wins in scan-path order: usage
+    /// totals remain deterministic even if only the surviving session label can
+    /// vary between equivalent copies.
     fn parse_cached_lane_deduped<F>(
         scan_result: &scanner::ScanResult,
         source_cache: &mut message_cache::SourceMessageCache,
@@ -2347,6 +2337,19 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         &mut all_messages,
         ClientId::Dsh,
         sessions::dsh::parse_dsh_file,
+    );
+
+    // LM Studio local-server logs can retain or repeat the same final response
+    // across files. Response IDs provide a stable cross-file dedup key, while
+    // the parser marks local inference as an authoritative zero-dollar cost so
+    // the generic cache cannot apply cloud model pricing.
+    parse_cached_lane_deduped(
+        &scan_result,
+        &mut source_cache,
+        pricing,
+        &mut all_messages,
+        ClientId::LmStudio,
+        sessions::lmstudio::parse_lmstudio_file,
     );
 
     // ZCode (Z.ai GLM-5.2 ADE) JSONL sessions. Token usage may be embedded
@@ -4838,6 +4841,21 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     let dsh_count = summed_parsed_message_count(&dsh_msgs);
     counts.set(ClientId::Dsh, dsh_count);
     messages.extend(dsh_msgs);
+
+    let lmstudio_msgs_raw: Vec<UnifiedMessage> = scan_result
+        .get(ClientId::LmStudio)
+        .par_iter()
+        .flat_map(|path| sessions::lmstudio::parse_lmstudio_file(path))
+        .collect();
+    let mut lmstudio_seen: HashSet<String> = HashSet::new();
+    let lmstudio_msgs: Vec<ParsedMessage> = lmstudio_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut lmstudio_seen, message))
+        .map(|message| unified_to_parsed(&message))
+        .collect();
+    let lmstudio_count = summed_parsed_message_count(&lmstudio_msgs);
+    counts.set(ClientId::LmStudio, lmstudio_count);
+    messages.extend(lmstudio_msgs);
 
     let mcode_msgs: Vec<ParsedMessage> = scan_result
         .get(ClientId::Mcode)
@@ -7562,6 +7580,76 @@ mod tests {
             1,
             "warm cache hit must not invoke the Cursor parser again"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_lmstudio_lane_deduplicates_files_and_preserves_zero_cost_on_cache_hits() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let logs = source_home.path().join(".lmstudio/server-logs/2026-07");
+        std::fs::create_dir_all(&logs).unwrap();
+
+        let response = |id: &str, prompt: i64, completion: i64| {
+            format!(
+                "[2026-07-09 10:00:00][INFO][fixture-model]\n{}\n",
+                serde_json::json!({
+                    "id": id,
+                    "model": "fixture-model",
+                    "usage": {
+                        "prompt_tokens": prompt,
+                        "completion_tokens": completion,
+                        "total_tokens": prompt + completion
+                    }
+                })
+            )
+        };
+        std::fs::write(
+            logs.join("first.log"),
+            format!(
+                "{}{}",
+                response("chatcmpl-shared", 7, 3),
+                response("chatcmpl-distinct", 14, 6)
+            ),
+        )
+        .unwrap();
+        std::fs::write(logs.join("mirrored.log"), response("chatcmpl-shared", 7, 3)).unwrap();
+
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "fixture-model".into(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(1.0),
+                output_cost_per_token: Some(1.0),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+        let clients = ["lmstudio".to_string()];
+
+        let cold = parse_all_messages_with_pricing(
+            source_home.path().to_str().unwrap(),
+            &clients,
+            Some(&pricing),
+        );
+        assert_eq!(cold.len(), 2);
+        assert_eq!(
+            cold.iter()
+                .map(|message| message.tokens.total())
+                .sum::<i64>(),
+            30
+        );
+        assert!(cold
+            .iter()
+            .all(|message| message.cost == 0.0 && message.has_authoritative_cost()));
+
+        let warm = parse_all_messages_with_pricing(
+            source_home.path().to_str().unwrap(),
+            &clients,
+            Some(&pricing),
+        );
+        assert_eq!(warm, cold);
     }
 
     /// MiMo Code records carry an authoritative per-message cost. The micode

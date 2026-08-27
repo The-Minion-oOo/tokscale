@@ -60,6 +60,8 @@ pub const CLIENT_UI: [ClientUi; ClientId::COUNT] = [
     // OpenClaw, MiMo Code / Mcode, Pi / Prime Agent), and `s` is the global
     // "sources" picker binding, so `Y` stands in for the Y in "oh mY pi".
     ClientUi { hotkey: 'Y' },
+    // LM Studio: uppercase `L` stays mnemonic while lowercase `l` belongs to Kilo.
+    ClientUi { hotkey: 'L' },
 ];
 
 pub fn display_name(client: ClientId) -> &'static str {

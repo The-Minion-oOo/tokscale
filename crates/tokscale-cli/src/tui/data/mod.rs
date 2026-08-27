@@ -1650,6 +1650,7 @@ mod tests {
         assert_eq!(clients[47], ClientId::Mcode);
         assert_eq!(clients[48], ClientId::Fx);
         assert_eq!(clients[49], ClientId::Omp);
+        assert_eq!(clients[50], ClientId::LmStudio);
     }
 
     #[test]
@@ -1705,6 +1706,7 @@ mod tests {
             "MiniMax Code",
             "Fx",
             "Oh My Pi",
+            "LM Studio",
         ];
 
         assert_eq!(expected.len(), ClientId::COUNT);
@@ -1752,6 +1754,7 @@ mod tests {
         assert_eq!(crate::tui::client_ui::hotkey(ClientId::Mcode), 'M');
         assert_eq!(crate::tui::client_ui::hotkey(ClientId::Fx), 'X');
         assert_eq!(crate::tui::client_ui::hotkey(ClientId::Omp), 'Y');
+        assert_eq!(crate::tui::client_ui::hotkey(ClientId::LmStudio), 'L');
     }
 
     #[test]
