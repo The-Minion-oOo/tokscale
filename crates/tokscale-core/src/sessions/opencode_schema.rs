@@ -730,6 +730,14 @@ struct SchemaAccumulator {
     messages: Vec<UnifiedMessage>,
     fingerprint_indices: HashMap<OpenCodeSchemaFingerprint, Vec<usize>>,
     dedup_states: Vec<SchemaDedupState>,
+    /// Dedup keys of every row that took part in a fingerprint merge, on both
+    /// sides of it.
+    ///
+    /// A merged entry is the only trace two rows left, so a later scan that
+    /// re-reads one of them cannot tell what the other contributed and cannot
+    /// reproduce the collapse. Only collected for a client with an incremental
+    /// lane, which is the only thing that reads it.
+    merged_dedup_keys: std::collections::HashSet<String>,
 }
 
 impl SchemaAccumulator {
@@ -922,6 +930,11 @@ impl SchemaAccumulator {
         };
 
         if let Some(index) = candidate {
+            let absorbed_dedup_key = if cfg.incremental_groups.is_some() {
+                unified.dedup_key.clone()
+            } else {
+                None
+            };
             // A duplicate carrying an authoritative cost upgrades the retained
             // entry's provenance. This is inert for clients that derive
             // provenance from the cost value alone: `cost_bits` is part of the
@@ -938,6 +951,14 @@ impl SchemaAccumulator {
                 self.messages[index].dedup_key = unified.dedup_key;
             }
             merge_duplicate_workspace(&mut self.messages[index], dedup_state, workspace_root);
+            if cfg.incremental_groups.is_some() {
+                if let Some(key) = self.messages[index].dedup_key.clone() {
+                    self.merged_dedup_keys.insert(key);
+                }
+                if let Some(key) = absorbed_dedup_key {
+                    self.merged_dedup_keys.insert(key);
+                }
+            }
             return;
         }
 
@@ -1050,7 +1071,20 @@ pub(crate) struct OpenCodeGroupMark {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct OpenCodeIncrementalState {
     pub groups: Vec<Option<OpenCodeGroupMark>>,
+    /// Dedup keys of the rows that took part in a fingerprint merge. A rescan
+    /// that re-reads one of them cannot reproduce the collapse -- the merged
+    /// entry is the only trace the other row left -- so it re-parses instead.
+    pub merged_dedup_keys: Vec<String>,
 }
+
+/// Ceiling on the merged-key set a mark will carry.
+///
+/// Forked history is a small fraction of a real database -- 2,711 of 342,927
+/// rows on the 14 GB profile this was measured against -- so a set anywhere
+/// near this size means the assumption does not hold for that database, and
+/// full scans are the honest answer rather than a mark whose bookkeeping is
+/// larger than the delta it saves.
+const MAX_MERGED_DEDUP_KEYS: usize = 250_000;
 
 /// Counts the rescans that stayed incremental, so a test can tell an
 /// incremental scan apart from a full re-parse that happened to agree with it.
@@ -1193,12 +1227,17 @@ pub(crate) fn scan_opencode_schema_sqlite(
         });
     }
 
+    resumable &= acc.merged_dedup_keys.len() <= MAX_MERGED_DEDUP_KEYS;
+    let merged_dedup_keys = acc.merged_dedup_keys.into_iter().collect();
+
     OpenCodeSchemaScan {
         messages: acc.messages,
-        incremental: cfg
-            .incremental_groups
-            .filter(|_| resumable)
-            .map(|_| OpenCodeIncrementalState { groups: marks }),
+        incremental: cfg.incremental_groups.filter(|_| resumable).map(|_| {
+            OpenCodeIncrementalState {
+                groups: marks,
+                merged_dedup_keys,
+            }
+        }),
     }
 }
 
@@ -1289,43 +1328,119 @@ pub(crate) fn rescan_opencode_schema_sqlite(
         }));
     }
 
-    let messages = merge_incremental_messages(cached_messages, acc.messages)?;
+    // A merge among the changed rows themselves is reproducible -- a full scan
+    // sees the same rows and collapses them the same way -- but it still leaves
+    // an entry a later rescan must not re-read piecemeal, so it joins the set.
+    let mut merged_dedup_keys = acc.merged_dedup_keys.clone();
+    merged_dedup_keys.extend(cached_state.merged_dedup_keys.iter().cloned());
+    if merged_dedup_keys.len() > MAX_MERGED_DEDUP_KEYS {
+        return None;
+    }
+
+    let messages = merge_incremental_messages(cached_messages, acc.messages, &merged_dedup_keys)?;
     #[cfg(test)]
     INCREMENTAL_RESCANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Some(OpenCodeSchemaScan {
         messages,
-        incremental: Some(OpenCodeIncrementalState { groups: marks }),
+        incremental: Some(OpenCodeIncrementalState {
+            groups: marks,
+            merged_dedup_keys: merged_dedup_keys.into_iter().collect(),
+        }),
     })
+}
+
+/// A digest of everything [`OpenCodeSchemaFingerprint`] compares, taken from
+/// the parsed message instead of the row.
+///
+/// Only ever used to ask "could a full scan have collapsed these two?", and it
+/// is deliberately the coarser of the two: `timestamp` and `duration_ms` are
+/// whole milliseconds where the row fingerprint keeps the raw float bits. A
+/// coarser digest can only claim a collapse that would not have happened,
+/// which costs a full re-parse -- the safe direction. It can never miss one.
+fn content_digest(message: &UnifiedMessage) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    message.timestamp.hash(&mut hasher);
+    message.duration_ms.hash(&mut hasher);
+    message.model_id.hash(&mut hasher);
+    message.provider_id.hash(&mut hasher);
+    message.tokens.input.hash(&mut hasher);
+    message.tokens.output.hash(&mut hasher);
+    message.tokens.reasoning.hash(&mut hasher);
+    message.tokens.cache_read.hash(&mut hasher);
+    message.tokens.cache_write.hash(&mut hasher);
+    message.cost.to_bits().hash(&mut hasher);
+    message.agent.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Fold the rows a rescan re-read back into the cached message list.
 ///
-/// A changed row replaces the cached message carrying its id and a new row is
-/// appended, so the cached relative order survives and the result holds one
-/// entry per message id -- the same set a full scan of the same database state
-/// produces. The lane keys on `dedup_key` everywhere downstream (cross-database
-/// and legacy-JSON suppression both), so position carries no meaning beyond
-/// that.
+/// A changed row replaces the cached message carrying its dedup key and a new
+/// row is appended, so the cached relative order survives and the result holds
+/// one entry per key -- the same set a full scan of the same database state
+/// produces.
 ///
-/// `None` when any message lacks a dedup key. The OpenCode driver always sets
-/// one, so this cannot happen; if it ever did, appending an unkeyed message
-/// would double count it on the next scan, and a full re-parse is the safe
-/// answer.
+/// The fingerprint dedup is what makes that non-trivial, because it lets one
+/// cached entry stand for more than one row (2,711 of 342,927 rows on the
+/// database this was measured against). Two rules keep the merge faithful to
+/// what a full scan would have produced:
+///
+/// * A row that already took part in a merge forces a full re-parse. The
+///   collapsed entry is the only trace the other row left, so re-reading one
+///   side cannot reconstruct what the other contributed.
+/// * A row whose content matches a cached message it is not itself replacing
+///   forces one too. That is a collapse a full scan would perform and this
+///   merge cannot see -- a forked copy arriving after the mark, or a rewrite
+///   that happens to land on another row's content.
+///
+/// `None` also when any message lacks a dedup key. The OpenCode driver always
+/// sets one, so that cannot happen; if it ever did, appending an unkeyed
+/// message would double count it on the next scan.
 fn merge_incremental_messages(
     cached: Vec<UnifiedMessage>,
     changed: Vec<UnifiedMessage>,
+    merged_dedup_keys: &std::collections::HashSet<String>,
 ) -> Option<Vec<UnifiedMessage>> {
     let mut merged = cached;
     let mut index_by_key: HashMap<String, usize> = HashMap::with_capacity(merged.len());
+    let mut index_by_digest: HashMap<u64, usize> = HashMap::with_capacity(merged.len());
     for (index, message) in merged.iter().enumerate() {
-        index_by_key.insert(message.dedup_key.clone()?, index);
+        // First index wins, matching the cross-database suppression the caller
+        // applies to this list: it keeps the first message carrying a key and
+        // drops the rest, so refreshing a later one would refresh a message
+        // nothing downstream reads.
+        index_by_key
+            .entry(message.dedup_key.clone()?)
+            .or_insert(index);
+        index_by_digest
+            .entry(content_digest(message))
+            .or_insert(index);
     }
 
     for message in changed {
         let key = message.dedup_key.clone()?;
-        match index_by_key.get(&key) {
-            Some(&index) => merged[index] = message,
+        if merged_dedup_keys.contains(&key) {
+            return None;
+        }
+        let digest = content_digest(&message);
+        match index_by_key.get(&key).copied() {
+            Some(index) => {
+                if index_by_digest
+                    .get(&digest)
+                    .is_some_and(|&other| other != index)
+                {
+                    return None;
+                }
+                index_by_digest.insert(digest, index);
+                merged[index] = message;
+            }
             None => {
+                if index_by_digest.contains_key(&digest) {
+                    return None;
+                }
+                index_by_digest.insert(digest, merged.len());
                 index_by_key.insert(key, merged.len());
                 merged.push(message);
             }

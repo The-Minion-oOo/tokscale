@@ -2010,6 +2010,88 @@ mod tests {
     }
 
     #[test]
+    fn test_incremental_rescan_refuses_a_row_that_took_part_in_a_merge() {
+        // Forked history puts one message id on two rows, and the fingerprint
+        // dedup collapses them into a single entry. That entry is the only
+        // trace the second row left, so re-reading either side cannot
+        // reconstruct what the other contributed -- the scan has to re-parse.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = create_timed_v1_db(&db_path);
+        for (row_id, created) in [("msg_fork_a", 1_000_i64), ("msg_fork_b", 1_500)] {
+            conn.execute(
+                "INSERT INTO message (id, session_id, time_created, time_updated, data)
+                 VALUES (?1, 'ses_1', ?2, ?2, ?3)",
+                rusqlite::params![row_id, created, timed_v1_payload("msg_shared", 11)],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let cold = scan_opencode_sqlite(&db_path);
+        assert_eq!(
+            cold.messages.len(),
+            1,
+            "forked copies collapse to one entry"
+        );
+        let state = cold.incremental.clone().unwrap();
+        assert!(
+            state.merged_dedup_keys.contains(&"msg_shared".to_string()),
+            "the collapse has to be recorded for the next scan to notice it"
+        );
+
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE message SET data = ?2, time_updated = ?3 WHERE id = ?1",
+            rusqlite::params!["msg_fork_b", timed_v1_payload("msg_shared", 77), 9_000],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(
+            rescan_opencode_sqlite(&db_path, &state, cold.messages).is_none(),
+            "a rewritten fork copy must re-parse rather than guess at the collapse"
+        );
+        assert_eq!(scan_opencode_sqlite(&db_path).messages.len(), 2);
+    }
+
+    #[test]
+    fn test_incremental_rescan_refuses_a_new_row_that_would_collapse() {
+        // A fork created after the mark copies completed turns verbatim. A full
+        // scan collapses each copy into the original; appending them would
+        // count every copied turn twice.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = create_timed_v1_db(&db_path);
+        insert_timed_v1_message(&conn, "msg_a", 1_000, 11);
+        drop(conn);
+
+        let cold = scan_opencode_sqlite(&db_path);
+        assert_eq!(cold.messages.len(), 1);
+        let state = cold.incremental.clone().unwrap();
+        assert!(state.merged_dedup_keys.is_empty());
+
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data)
+             VALUES ('msg_a_copy', 'ses_1', 9_500, 9_500, ?1)",
+            rusqlite::params![timed_v1_payload("msg_a", 11)],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(
+            rescan_opencode_sqlite(&db_path, &state, cold.messages).is_none(),
+            "a copied turn must re-parse rather than be appended beside its original"
+        );
+        assert_eq!(
+            scan_opencode_sqlite(&db_path).messages.len(),
+            1,
+            "the full parse still collapses the copy"
+        );
+    }
+
+    #[test]
     fn test_incremental_rescan_refuses_a_mark_from_a_different_schema_variant() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("opencode.db");
