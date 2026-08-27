@@ -780,6 +780,88 @@ fn opencode_json_superseded_by_sqlite(path: &Path, sqlite_keys: &HashSet<String>
         .is_some_and(|stem| sqlite_keys.contains(stem))
 }
 
+/// Receives fully-transformed messages as each client lane finishes, so the
+/// parse never has to hold every lane's messages at once.
+///
+/// The parse used to accumulate ~1M `UnifiedMessage` into one `Vec` and hand it
+/// back whole, which made peak memory the *sum* of every client lane (#1209).
+/// Draining into a sink between lanes makes it the *largest* lane instead.
+/// Callers that genuinely want the whole vector still get one: `Vec` is a sink.
+trait MessageSink {
+    fn accept(&mut self, message: UnifiedMessage);
+}
+
+impl MessageSink for Vec<UnifiedMessage> {
+    fn accept(&mut self, message: UnifiedMessage) {
+        self.push(message);
+    }
+}
+
+/// Inputs for the three whole-set passes that used to run once at the end of
+/// the parse. Each is stateless per message, so applying them at flush time is
+/// equivalent to applying them to the finished vector -- and it lets messages
+/// be released a lane at a time.
+struct FlushContext<'a> {
+    include_all: bool,
+    requested: HashSet<&'a str>,
+    include_synthetic: bool,
+    /// Re-keys every message onto the device's pinned bucketing timezone.
+    ///
+    /// The parsers derive `date` from `chrono::Local`, read afresh on every
+    /// scan, so which day a message lands in moves when the machine's zone
+    /// does. Fixing the day key here is what a rescan cannot then move.
+    ///
+    /// `Some` only when a zone is pinned: an unpinned device must report
+    /// exactly what it reported before, so the pass is skipped rather than
+    /// re-derived through `Local`.
+    ///
+    /// This used to be a whole-corpus `rebucket_days` pass that deliberately
+    /// ran *after* `save_if_dirty`. Flushing per lane necessarily re-keys most
+    /// messages before that write, which stays correct because a
+    /// `CachedSourceEntry` owns its own payload -- re-keying a drained message
+    /// cannot reach one -- and because `refresh_derived_fields` re-derives
+    /// `date` on every cache load, so no cached entry can carry a stale day
+    /// key regardless of when it was written.
+    timezone: Option<bucket_tz::BucketTimezone>,
+}
+
+/// Drain `buffer` into `sink`, applying the tail passes to each message.
+///
+/// The order is load-bearing and matches the original tail: filter BEFORE
+/// normalization, so `retain_for_requested_clients` still sees the original
+/// model/provider prefixes that `is_synthetic_gateway` relies on.
+fn flush_lane<S: MessageSink>(
+    buffer: &mut Vec<UnifiedMessage>,
+    context: &FlushContext<'_>,
+    sink: &mut S,
+) {
+    for mut message in buffer.drain(..) {
+        if !context.include_all
+            && !retain_for_requested_clients(
+                &message.client,
+                &message.model_id,
+                &message.provider_id,
+                &context.requested,
+            )
+        {
+            continue;
+        }
+
+        if context.include_synthetic {
+            sessions::synthetic::normalize_synthetic_gateway_fields(
+                &mut message.model_id,
+                &mut message.provider_id,
+            );
+        }
+
+        if let Some(timezone) = &context.timezone {
+            message.rebucket_date(timezone);
+        }
+
+        sink.accept(message);
+    }
+}
+
 fn parse_all_messages_with_pricing_with_cache_policy(
     home_dir: &str,
     clients: &[String],
@@ -788,6 +870,28 @@ fn parse_all_messages_with_pricing_with_cache_policy(
     scanner_settings: &scanner::ScannerSettings,
     cache_policy: SourceCachePolicy,
 ) -> Vec<UnifiedMessage> {
+    let mut messages: Vec<UnifiedMessage> = Vec::new();
+    parse_all_messages_streaming(
+        home_dir,
+        clients,
+        pricing,
+        use_env_roots,
+        scanner_settings,
+        cache_policy,
+        &mut messages,
+    );
+    messages
+}
+
+fn parse_all_messages_streaming<S: MessageSink>(
+    home_dir: &str,
+    clients: &[String],
+    pricing: Option<&pricing::PricingService>,
+    use_env_roots: bool,
+    scanner_settings: &scanner::ScannerSettings,
+    cache_policy: SourceCachePolicy,
+    sink: &mut S,
+) {
     #[derive(Debug)]
     struct CachedParseOutcome {
         messages: Vec<UnifiedMessage>,
@@ -1637,6 +1741,15 @@ fn parse_all_messages_with_pricing_with_cache_policy(
     let mut all_messages: Vec<UnifiedMessage> = Vec::new();
     let include_all = clients.is_empty();
     let include_synthetic = include_all || clients.iter().any(|c| c == "synthetic");
+    let flush_context = {
+        let timezone = bucket_tz::BucketTimezone::from_scanner_settings(scanner_settings);
+        FlushContext {
+            include_all,
+            requested: clients.iter().map(String::as_str).collect(),
+            include_synthetic,
+            timezone: timezone.is_pinned().then_some(timezone),
+        }
+    };
     let include_devin_cli = include_synthetic || clients.iter().any(|c| c == "devin-cli");
     let include_devin_desktop = include_synthetic || clients.iter().any(|c| c == "devin-desktop");
     // Freebuff and Codebuff share the manicode scan bucket in the scanner (the
@@ -1710,6 +1823,11 @@ fn parse_all_messages_with_pricing_with_cache_policy(
     }
 
     // Parse MiMo Code: SQLite database(s)
+    // OpenCode is the largest lane; release it before MiMo Code starts.
+    // `micode_indices` below stores indices into `all_messages`, so this must
+    // happen before the first one is recorded -- never inside that loop.
+    flush_lane(&mut all_messages, &flush_context, sink);
+
     let mut micode_indices: HashMap<String, usize> = HashMap::new();
 
     for db_path in &scan_result.micode_dbs {
@@ -1752,6 +1870,9 @@ fn parse_all_messages_with_pricing_with_cache_policy(
             source_cache.insert(entry);
         }
     }
+
+    // MiMo Code is done indexing into `all_messages`; release it.
+    flush_lane(&mut all_messages, &flush_context, sink);
 
     let claude_home = PathBuf::from(home_dir);
     let claude_outcomes: Vec<CachedParseOutcome> = scan_result
@@ -1816,6 +1937,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         }
     }
     all_messages.extend(claude_messages.into_iter().map(|(_, message)| message));
+    flush_lane(&mut all_messages, &flush_context, sink);
 
     let codex_outcomes: Vec<(PathBuf, CachedParseOutcome)> = scan_result
         .get(ClientId::Codex)
@@ -1844,6 +1966,12 @@ fn parse_all_messages_with_pricing_with_cache_policy(
             );
         }
     }
+
+    // Release Codex before Copilot. This has to sit ahead of the Copilot
+    // lane rather than after it: the desktop/vscode blocks below scan
+    // `all_messages` for `client == "copilot"` to dedup against OTEL rows, so
+    // copilot's own messages must still be buffered when they run.
+    flush_lane(&mut all_messages, &flush_context, sink);
 
     parse_cached_lane(
         &scan_result,
@@ -2141,6 +2269,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
     );
     apply_pricing_to_messages(&mut prime_agent_messages, pricing);
     all_messages.extend(prime_agent_messages);
+    flush_lane(&mut all_messages, &flush_context, sink);
 
     let kimchi_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Kimchi)
@@ -2883,58 +3012,14 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         }
     }
 
-    // Filter BEFORE normalization so retain_for_requested_clients can see
-    // original model/provider prefixes (e.g. "accounts/fireworks/models/…")
-    // that is_synthetic_gateway relies on for gateway detection.
-    if !include_all {
-        let requested: HashSet<&str> = clients.iter().map(String::as_str).collect();
-        all_messages.retain(|msg| {
-            retain_for_requested_clients(&msg.client, &msg.model_id, &msg.provider_id, &requested)
-        });
-    }
-
-    if include_synthetic {
-        for msg in &mut all_messages {
-            sessions::synthetic::normalize_synthetic_gateway_fields(
-                &mut msg.model_id,
-                &mut msg.provider_id,
-            );
-        }
-    }
-
     if cache_policy == SourceCachePolicy::Persistent {
         source_cache.save_if_dirty();
     }
 
-    rebucket_days(&mut all_messages, scanner_settings);
-
-    all_messages
-}
-
-/// Re-key every message onto the device's pinned bucketing timezone.
-///
-/// The parsers derive `date` from `chrono::Local`, read afresh on every scan,
-/// so which day a message lands in changes when the machine's zone does. This
-/// is the one pass that knows the user's settings and sees every message, so it
-/// is where the day key gets fixed to something a rescan cannot move.
-///
-/// Runs after the source cache is written on purpose: the cache stores raw
-/// parser output and `refresh_derived_fields` re-derives `date` on every load,
-/// so cached entries never carry a stale day key past this point and changing
-/// the pinned zone needs no cache invalidation.
-///
-/// **No-op when nothing is pinned.** An unpinned device must report exactly
-/// what it reported before, so the pass is skipped rather than re-derived
-/// through `Local`.
-fn rebucket_days(messages: &mut [UnifiedMessage], scanner_settings: &scanner::ScannerSettings) {
-    let timezone = bucket_tz::BucketTimezone::from_scanner_settings(scanner_settings);
-    if !timezone.is_pinned() {
-        return;
-    }
-
-    for message in messages.iter_mut() {
-        message.rebucket_date(&timezone);
-    }
+    // retain/normalize/rebucket used to run here as three whole-set passes.
+    // They now run per message inside `flush_lane`, which is also where the
+    // messages are released.
+    flush_lane(&mut all_messages, &flush_context, sink);
 }
 
 fn dedupe_latest_trae_messages(mut messages: Vec<UnifiedMessage>) -> Vec<UnifiedMessage> {
@@ -5300,8 +5385,8 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     })
 }
 
-/// [`rebucket_days`] for the `ParsedMessage` lane. Same contract: no-op unless
-/// a zone is pinned.
+/// [`FlushContext::timezone`] for the `ParsedMessage` lane. Same contract:
+/// no-op unless a zone is pinned.
 fn rebucket_parsed_days(
     messages: &mut [ParsedMessage],
     scanner_settings: &scanner::ScannerSettings,
