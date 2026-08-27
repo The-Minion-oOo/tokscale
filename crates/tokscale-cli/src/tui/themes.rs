@@ -41,12 +41,11 @@ impl TerminalColorMode {
             return Self::Compatible;
         }
 
-        if term_program == "tmux" {
-            if matches!(colorterm.as_str(), "truecolor" | "24bit")
-                || term.contains("tmux-256color")
-            {
-                return Self::FullColor;
-            }
+        if term_program == "tmux"
+            && (matches!(colorterm.as_str(), "truecolor" | "24bit")
+                || term.contains("tmux-256color"))
+        {
+            return Self::FullColor;
         }
 
         if matches!(colorterm.as_str(), "truecolor" | "24bit")
