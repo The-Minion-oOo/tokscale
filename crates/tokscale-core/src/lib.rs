@@ -1491,6 +1491,120 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         )
     }
 
+    /// OpenCode's SQLite lane, where a warm scan reads only the rows that
+    /// changed since the last one.
+    ///
+    /// Bespoke rather than routed through `load_or_parse_sqlite_source`: the
+    /// incremental scan needs the cached *messages* to merge into, which the
+    /// generic parse closure never sees, plus the mark the previous scan left
+    /// on the entry. Codex has its own loader for the same reason.
+    fn load_or_parse_opencode_sqlite_source(
+        path: &Path,
+        source_cache: &message_cache::SourceMessageCache,
+        pricing: Option<&pricing::PricingService>,
+    ) -> CachedParseOutcome {
+        let identity = message_cache::CacheIdentity::for_client(ClientId::OpenCode);
+
+        fn finish(
+            identity: message_cache::CacheIdentity,
+            path: &Path,
+            fingerprint: Option<message_cache::SourceFingerprint>,
+            scan: sessions::opencode_schema::OpenCodeSchemaScan,
+            pricing: Option<&pricing::PricingService>,
+        ) -> CachedParseOutcome {
+            let mut messages = scan.messages;
+            let cache_entry = match fingerprint {
+                Some(fingerprint) if !messages.is_empty() => Some(
+                    message_cache::CachedSourceEntry::new(
+                        identity,
+                        path,
+                        fingerprint,
+                        messages.clone(),
+                        Vec::new(),
+                        None,
+                    )
+                    .with_opencode_incremental(scan.incremental),
+                ),
+                _ => None,
+            };
+            apply_pricing_to_messages(&mut messages, pricing);
+            CachedParseOutcome {
+                messages,
+                retained_message_keys: HashSet::new(),
+                cache_entry,
+                invalidate_cache: false,
+            }
+        }
+
+        let mut cached = source_cache.take(identity, path);
+        let Some(fingerprint_status) = message_cache::SourceFingerprint::check_sqlite_path(
+            path,
+            cached.as_ref().map(|entry| &entry.fingerprint),
+        ) else {
+            return finish(
+                identity,
+                path,
+                None,
+                sessions::opencode::scan_opencode_sqlite(path),
+                pricing,
+            );
+        };
+
+        let fingerprint = match fingerprint_status {
+            message_cache::FingerprintStatus::Unchanged => {
+                let Some(entry) = cached.take() else {
+                    unreachable!("an uncached source always builds a complete fingerprint")
+                };
+                if !entry.messages.is_empty() {
+                    return CachedParseOutcome {
+                        messages: cached_messages(entry, pricing),
+                        retained_message_keys: HashSet::new(),
+                        cache_entry: None,
+                        invalidate_cache: false,
+                    };
+                }
+                let fingerprint = entry.fingerprint.clone();
+                cached = Some(entry);
+                fingerprint
+            }
+            message_cache::FingerprintStatus::Changed(fingerprint) => fingerprint,
+        };
+
+        if let Some(entry) = cached {
+            if entry.fingerprint == fingerprint && !entry.messages.is_empty() {
+                return CachedParseOutcome {
+                    messages: cached_messages(entry, pricing),
+                    retained_message_keys: HashSet::new(),
+                    cache_entry: None,
+                    invalidate_cache: false,
+                };
+            }
+
+            // The database changed under an entry that recorded how far the
+            // last scan got. Read just the delta; the rescan itself decides
+            // whether that is still sound and says so by returning `None`.
+            if let (Some(state), false) = (
+                entry.opencode_incremental.as_ref(),
+                entry.messages.is_empty(),
+            ) {
+                let state = state.clone();
+                if let Some(scan) =
+                    sessions::opencode::rescan_opencode_sqlite(path, &state, entry.messages)
+                {
+                    return finish(identity, path, Some(fingerprint), scan, pricing);
+                }
+            }
+        }
+
+        finish(
+            identity,
+            path,
+            Some(fingerprint),
+            sessions::opencode::scan_opencode_sqlite(path),
+            pricing,
+        )
+    }
+
     fn load_or_parse_codex_source(
         path: &Path,
         source_cache: &message_cache::SourceMessageCache,
@@ -1638,13 +1752,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
             messages,
             cache_entry,
             ..
-        } = load_or_parse_sqlite_source(
-            message_cache::CacheIdentity::for_client(ClientId::OpenCode),
-            db_path,
-            &source_cache,
-            pricing,
-            sessions::opencode::parse_opencode_sqlite,
-        );
+        } = load_or_parse_opencode_sqlite_source(db_path, &source_cache, pricing);
 
         // Dedup across channel-suffixed dbs: the same session can end up in
         // both `opencode.db` and `opencode-<channel>.db` if the user

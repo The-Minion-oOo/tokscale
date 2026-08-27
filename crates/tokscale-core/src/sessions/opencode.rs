@@ -12,8 +12,9 @@
 // The message payload type and the SQLite driver are shared with every other
 // client that adopted OpenCode's schema.
 use super::opencode_schema::{
-    parse_opencode_schema_sqlite, reported_cost, set_workspace_from_root, OpenCodeSchemaConfig,
-    OpenCodeSchemaMessage as OpenCodeMessage,
+    parse_opencode_schema_sqlite, rescan_opencode_schema_sqlite, reported_cost,
+    scan_opencode_schema_sqlite, set_workspace_from_root, OpenCodeIncrementalState,
+    OpenCodeSchemaConfig, OpenCodeSchemaMessage as OpenCodeMessage, OpenCodeSchemaScan,
 };
 use super::utils::read_file_or_none;
 use super::{normalize_opencode_agent_name, UnifiedMessage};
@@ -25,6 +26,26 @@ use std::path::Path;
 
 pub fn parse_opencode_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
     parse_opencode_schema_sqlite(db_path, OpenCodeSchemaConfig::opencode())
+}
+
+/// Full scan that also records where a later scan can resume from.
+pub(crate) fn scan_opencode_sqlite(db_path: &Path) -> OpenCodeSchemaScan {
+    scan_opencode_schema_sqlite(db_path, OpenCodeSchemaConfig::opencode())
+}
+
+/// Resume from `cached_state`, reading only the rows that changed. `None`
+/// means the caller has to fall back to [`scan_opencode_sqlite`].
+pub(crate) fn rescan_opencode_sqlite(
+    db_path: &Path,
+    cached_state: &OpenCodeIncrementalState,
+    cached_messages: Vec<UnifiedMessage>,
+) -> Option<OpenCodeSchemaScan> {
+    rescan_opencode_schema_sqlite(
+        db_path,
+        OpenCodeSchemaConfig::opencode(),
+        cached_state,
+        cached_messages,
+    )
 }
 
 pub fn parse_opencode_file(path: &Path) -> Option<UnifiedMessage> {
@@ -1756,6 +1777,281 @@ mod tests {
         assert!(loaded.migration_complete);
         assert_eq!(loaded.json_file_count, 2);
     }
+
+    // =========================================================================
+    // Incremental SQLite scan
+    // =========================================================================
+
+    /// A `message` table with the columns a modern OpenCode database actually
+    /// has. The existing fixtures above deliberately keep the minimal column
+    /// set, which is itself a case the incremental lane has to refuse.
+    fn create_timed_v1_db(db_path: &Path) -> Connection {
+        let conn = Connection::open(db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                directory TEXT NOT NULL,
+                title TEXT
+            );
+            CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            INSERT INTO session (id, directory, title)
+            VALUES ('ses_1', '/tmp/project', 'A session');",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn timed_v1_payload(id: &str, output: i64) -> String {
+        format!(
+            r#"{{
+                "id": "{id}",
+                "role": "assistant",
+                "sessionID": "ses_1",
+                "modelID": "claude-sonnet-4",
+                "providerID": "anthropic",
+                "cost": 0.5,
+                "tokens": {{
+                    "input": 10,
+                    "output": {output},
+                    "reasoning": 0,
+                    "cache": {{ "read": 0, "write": 0 }}
+                }},
+                "time": {{ "created": 1783882279705, "completed": 1783882279943 }}
+            }}"#
+        )
+    }
+
+    fn insert_timed_v1_message(conn: &Connection, id: &str, created: i64, output: i64) {
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data)
+             VALUES (?1, 'ses_1', ?2, ?2, ?3)",
+            rusqlite::params![id, created, timed_v1_payload(id, output)],
+        )
+        .unwrap();
+    }
+
+    /// Rewrite a row's payload and stamp it as updated at `updated`, which is
+    /// what OpenCode does to a message long after inserting it.
+    fn touch_timed_v1_message(conn: &Connection, id: &str, updated: i64, output: i64) {
+        let changed = conn
+            .execute(
+                "UPDATE message SET data = ?2, time_updated = ?3 WHERE id = ?1",
+                rusqlite::params![id, timed_v1_payload(id, output), updated],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "fixture row {id} should exist");
+    }
+
+    fn by_dedup_key(messages: &[UnifiedMessage]) -> Vec<UnifiedMessage> {
+        let mut sorted = messages.to_vec();
+        sorted.sort_by(|left, right| left.dedup_key.cmp(&right.dedup_key));
+        sorted
+    }
+
+    fn output_tokens(messages: &[UnifiedMessage], dedup_key: &str) -> i64 {
+        messages
+            .iter()
+            .find(|message| message.dedup_key.as_deref() == Some(dedup_key))
+            .unwrap_or_else(|| panic!("{dedup_key} should be present"))
+            .tokens
+            .output
+    }
+
+    #[test]
+    fn test_incremental_rescan_matches_a_full_parse_of_the_same_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = create_timed_v1_db(&db_path);
+        insert_timed_v1_message(&conn, "msg_a", 1_000, 11);
+        insert_timed_v1_message(&conn, "msg_b", 2_000, 22);
+        drop(conn);
+
+        let cold = scan_opencode_sqlite(&db_path);
+        assert_eq!(cold.messages.len(), 2);
+        let state = cold
+            .incremental
+            .clone()
+            .expect("a table with the time columns is resumable");
+
+        let conn = Connection::open(&db_path).unwrap();
+        touch_timed_v1_message(&conn, "msg_a", 9_000, 111);
+        insert_timed_v1_message(&conn, "msg_c", 9_500, 33);
+        drop(conn);
+
+        let warm = rescan_opencode_sqlite(&db_path, &state, cold.messages)
+            .expect("an insert-only delta stays incremental");
+        let full = scan_opencode_sqlite(&db_path);
+
+        assert_eq!(
+            by_dedup_key(&warm.messages),
+            by_dedup_key(&full.messages),
+            "a warm incremental scan and a cold full parse must agree"
+        );
+        assert_eq!(warm.messages.len(), 3);
+        assert_eq!(output_tokens(&warm.messages, "msg_a"), 111);
+        assert_eq!(output_tokens(&warm.messages, "msg_c"), 33);
+    }
+
+    #[test]
+    fn test_incremental_rescan_reads_a_row_rewritten_long_after_it_was_inserted() {
+        // The row that changes is the *oldest* one and sorts first by id, so a
+        // mark keyed on the row id -- the Codex `consumed_offset` analogue --
+        // would skip it. On a real database 99.98% of rows are rewritten after
+        // insert, so that mark would under-report nearly everything.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = create_timed_v1_db(&db_path);
+        insert_timed_v1_message(&conn, "msg_aaa", 1_000, 11);
+        insert_timed_v1_message(&conn, "msg_zzz", 2_000, 22);
+        drop(conn);
+
+        let cold = scan_opencode_sqlite(&db_path);
+        let state = cold.incremental.clone().unwrap();
+        assert_eq!(output_tokens(&cold.messages, "msg_aaa"), 11);
+
+        let conn = Connection::open(&db_path).unwrap();
+        touch_timed_v1_message(&conn, "msg_aaa", 9_000, 999);
+        drop(conn);
+
+        let warm = rescan_opencode_sqlite(&db_path, &state, cold.messages)
+            .expect("an in-place rewrite is not a deletion");
+
+        assert_eq!(
+            output_tokens(&warm.messages, "msg_aaa"),
+            999,
+            "a row rewritten after insert must reach the incremental scan"
+        );
+        assert_eq!(warm.messages.len(), 2, "a rewrite must not duplicate a row");
+        assert_eq!(
+            by_dedup_key(&warm.messages),
+            by_dedup_key(&scan_opencode_sqlite(&db_path).messages)
+        );
+    }
+
+    #[test]
+    fn test_incremental_rescan_refuses_a_database_that_lost_a_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = create_timed_v1_db(&db_path);
+        insert_timed_v1_message(&conn, "msg_a", 1_000, 11);
+        insert_timed_v1_message(&conn, "msg_b", 2_000, 22);
+        drop(conn);
+
+        let cold = scan_opencode_sqlite(&db_path);
+        let state = cold.incremental.clone().unwrap();
+
+        // OpenCode cascades a session delete onto its messages; the row is
+        // simply gone, and no incremental query can report its absence.
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("DELETE FROM message WHERE id = 'msg_b'", []).unwrap();
+        drop(conn);
+
+        assert!(
+            rescan_opencode_sqlite(&db_path, &state, cold.messages).is_none(),
+            "a lost row must force a full re-parse instead of keeping a stale count"
+        );
+
+        let full = scan_opencode_sqlite(&db_path);
+        assert_eq!(full.messages.len(), 1);
+        assert_eq!(full.messages[0].dedup_key.as_deref(), Some("msg_a"));
+    }
+
+    #[test]
+    fn test_incremental_rescan_refuses_a_delete_masked_by_an_insert() {
+        // The row count alone cannot tell this apart from "nothing happened",
+        // which is why the mark also records the `time_created` high-water.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = create_timed_v1_db(&db_path);
+        insert_timed_v1_message(&conn, "msg_a", 1_000, 11);
+        insert_timed_v1_message(&conn, "msg_b", 2_000, 22);
+        drop(conn);
+
+        let cold = scan_opencode_sqlite(&db_path);
+        let state = cold.incremental.clone().unwrap();
+
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("DELETE FROM message WHERE id = 'msg_b'", []).unwrap();
+        insert_timed_v1_message(&conn, "msg_c", 9_500, 33);
+        drop(conn);
+
+        assert!(
+            rescan_opencode_sqlite(&db_path, &state, cold.messages).is_none(),
+            "an equal row count is not evidence that nothing was deleted"
+        );
+    }
+
+    #[test]
+    fn test_a_table_without_the_time_columns_records_no_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = create_opencode_sqlite_db(&db_path);
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, 'ses_1', ?2)",
+            rusqlite::params!["msg_a", timed_v1_payload("msg_a", 11)],
+        )
+        .unwrap();
+        drop(conn);
+
+        let cold = scan_opencode_sqlite(&db_path);
+        assert_eq!(cold.messages.len(), 1);
+        assert!(
+            cold.incremental.is_none(),
+            "rows that cannot be rescanned incrementally must not be marked as if they could"
+        );
+    }
+
+    #[test]
+    fn test_incremental_rescan_refuses_a_mark_from_a_different_schema_variant() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        insert_timed_v1_message(&conn, "msg_a", 1_000, 11);
+        drop(conn);
+
+        let cold = scan_opencode_sqlite(&db_path);
+        let state = cold.incremental.clone().unwrap();
+        assert_eq!(cold.messages[0].workspace_key, None);
+
+        // The session metadata table appears, so a full scan would now pick the
+        // joining variant and resolve a workspace the cached rows never had.
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                directory TEXT NOT NULL,
+                title TEXT
+            );
+            INSERT INTO session (id, directory, title)
+            VALUES ('ses_1', '/tmp/project', 'A session');",
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(
+            rescan_opencode_sqlite(&db_path, &state, cold.messages).is_none(),
+            "a variant change must invalidate the mark"
+        );
+        assert!(scan_opencode_sqlite(&db_path).messages[0]
+            .workspace_key
+            .is_some());
+    }
 }
 
 #[cfg(test)]
@@ -1790,4 +2086,5 @@ mod integration_tests {
             "Expected to parse some messages from SQLite"
         );
     }
+
 }

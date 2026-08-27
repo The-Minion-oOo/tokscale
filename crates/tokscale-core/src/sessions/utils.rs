@@ -354,6 +354,22 @@ pub(crate) fn sqlite_for_each_row_on(
     what: Option<&str>,
     sink: &mut dyn FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<()>,
 ) -> SqliteScan {
+    sqlite_for_each_row_on_with_params(conn, db_path, sql, &[], what, sink)
+}
+
+/// [`sqlite_for_each_row_on`] with bound parameters.
+///
+/// Split out rather than folded into the caller so a query whose bounds come
+/// from cached state binds them instead of formatting them into the SQL text,
+/// which would also defeat SQLite's statement cache.
+pub(crate) fn sqlite_for_each_row_on_with_params(
+    conn: &Connection,
+    db_path: &Path,
+    sql: &str,
+    params: &[&dyn rusqlite::ToSql],
+    what: Option<&str>,
+    sink: &mut dyn FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<()>,
+) -> SqliteScan {
     let mut stmt = match conn.prepare(sql) {
         Ok(stmt) => stmt,
         Err(err) => {
@@ -369,7 +385,7 @@ pub(crate) fn sqlite_for_each_row_on(
         }
     };
 
-    let mut rows = match stmt.query([]) {
+    let mut rows = match stmt.query(params) {
         Ok(rows) => rows,
         Err(err) => {
             if let Some(what) = what {

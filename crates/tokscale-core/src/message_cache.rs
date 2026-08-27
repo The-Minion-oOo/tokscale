@@ -28,8 +28,13 @@ use std::time::UNIX_EPOCH;
 // 5: Prime Agent entries cache reconciliation accounting beside their messages.
 // Version-4 shards have an explicit wire migration below, so other clients stay
 // warm and Prime entries need only one rebuild/backfill.
-const CACHE_FORMAT_VERSION: u32 = 5;
-const LEGACY_CACHE_FORMAT_VERSION: u32 = 4;
+// 6: OpenCode SQLite entries cache the mark an incremental rescan resumes from.
+// Both older layouts have wire migrations below, so nothing is discarded --
+// which matters most for Claude, whose entries are the only copy of compacted
+// history.
+const CACHE_FORMAT_VERSION: u32 = 6;
+const LEGACY_CACHE_FORMAT_VERSION_V4: u32 = 4;
+const LEGACY_CACHE_FORMAT_VERSION_V5: u32 = 5;
 // V2 intentionally starts cold and leaves source-message-cache.bin untouched:
 // the monolith did not record a trustworthy parser owner for migration.
 const CACHE_SHARD_DIRNAME: &str = "source-message-cache-v2";
@@ -1349,6 +1354,12 @@ pub(crate) struct CachedSourceEntry {
     /// transcripts. It shares this entry's parser identity and fingerprint, so
     /// a message cache hit can never pair with accounting from different bytes.
     pub prime_accounting: Option<crate::sessions::prime_agent::PrimeFileAccounting>,
+    /// OpenCode-only mark saying how far a previous scan of this database got,
+    /// so the next one reads only the rows that changed. Like the fields above
+    /// it lives on the entry rather than beside it: a mark paired with anything
+    /// other than the message list it was taken with would skip rows and
+    /// under-report.
+    pub opencode_incremental: Option<crate::sessions::opencode_schema::OpenCodeIncrementalState>,
 }
 
 /// Exact version-4 entry layout. Keeping this wire type lets existing shards
@@ -1377,6 +1388,38 @@ impl From<LegacyCachedSourceEntryV4> for CachedSourceEntry {
             fallback_timestamp_indices: entry.fallback_timestamp_indices,
             codex_incremental: entry.codex_incremental,
             prime_accounting: None,
+            opencode_incremental: None,
+        }
+    }
+}
+
+/// Exact version-5 entry layout, migrated for the same reason version 4 is.
+/// An OpenCode entry arrives with no incremental mark and takes one full parse
+/// to acquire it, which is what it would have done anyway.
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyCachedSourceEntryV5 {
+    parser_namespace: String,
+    parser_version: u32,
+    path: CachedPath,
+    fingerprint: SourceFingerprint,
+    messages: Vec<UnifiedMessage>,
+    fallback_timestamp_indices: Vec<usize>,
+    codex_incremental: Option<CodexIncrementalCache>,
+    prime_accounting: Option<crate::sessions::prime_agent::PrimeFileAccounting>,
+}
+
+impl From<LegacyCachedSourceEntryV5> for CachedSourceEntry {
+    fn from(entry: LegacyCachedSourceEntryV5) -> Self {
+        Self {
+            parser_namespace: entry.parser_namespace,
+            parser_version: entry.parser_version,
+            path: entry.path,
+            fingerprint: entry.fingerprint,
+            messages: entry.messages,
+            fallback_timestamp_indices: entry.fallback_timestamp_indices,
+            codex_incremental: entry.codex_incremental,
+            prime_accounting: entry.prime_accounting,
+            opencode_incremental: None,
         }
     }
 }
@@ -1399,7 +1442,17 @@ impl CachedSourceEntry {
             fallback_timestamp_indices,
             codex_incremental,
             prime_accounting: None,
+            opencode_incremental: None,
         }
+    }
+
+    /// Attach the mark a later OpenCode scan resumes from.
+    pub(crate) fn with_opencode_incremental(
+        mut self,
+        incremental: Option<crate::sessions::opencode_schema::OpenCodeIncrementalState>,
+    ) -> Self {
+        self.opencode_incremental = incremental;
+        self
     }
 
     pub(crate) fn with_prime_accounting(
@@ -1438,6 +1491,7 @@ impl CachedSourceEntry {
             fallback_timestamp_indices: std::mem::take(&mut self.fallback_timestamp_indices),
             codex_incremental: self.codex_incremental.take(),
             prime_accounting: self.prime_accounting.take(),
+            opencode_incremental: self.opencode_incremental.take(),
         }
     }
 
@@ -2224,10 +2278,21 @@ fn read_shard_with_limit(
         return ShardReadStatus::Stale;
     }
 
-    if envelope.format_version == LEGACY_CACHE_FORMAT_VERSION {
+    if envelope.format_version == LEGACY_CACHE_FORMAT_VERSION_V4 {
         return match bincode::options()
             .with_limit(max_shard_bytes)
             .deserialize::<Vec<LegacyCachedSourceEntryV4>>(&envelope.payload)
+        {
+            Ok(entries) => ShardReadStatus::Migrated(
+                entries.into_iter().map(CachedSourceEntry::from).collect(),
+            ),
+            Err(error) => ShardReadStatus::Invalid(error.to_string()),
+        };
+    }
+    if envelope.format_version == LEGACY_CACHE_FORMAT_VERSION_V5 {
+        return match bincode::options()
+            .with_limit(max_shard_bytes)
+            .deserialize::<Vec<LegacyCachedSourceEntryV5>>(&envelope.payload)
         {
             Ok(entries) => ShardReadStatus::Migrated(
                 entries.into_iter().map(CachedSourceEntry::from).collect(),
@@ -4366,7 +4431,7 @@ mod tests {
         let stale_path = shard_path(&cache_shard_dir().unwrap(), &stale_key);
         ensure_cache_dir(stale_path.parent().unwrap()).unwrap();
         let stale_envelope = CachedShardEnvelope {
-            format_version: LEGACY_CACHE_FORMAT_VERSION - 1,
+            format_version: LEGACY_CACHE_FORMAT_VERSION_V4 - 1,
             parser_namespace: codex.namespace.to_string(),
             parser_version: codex.parser_version,
             payload: b"prior UnifiedMessage layout".to_vec(),
@@ -4405,7 +4470,7 @@ mod tests {
             codex_incremental: entry.codex_incremental,
         };
         let envelope = CachedShardEnvelope {
-            format_version: LEGACY_CACHE_FORMAT_VERSION,
+            format_version: LEGACY_CACHE_FORMAT_VERSION_V4,
             parser_namespace: identity.namespace.to_string(),
             parser_version: identity.parser_version,
             payload: bincode::options().serialize(&vec![legacy_entry]).unwrap(),
