@@ -12,9 +12,36 @@ use crate::TokenBreakdown;
 use chrono::{Local, LocalResult, NaiveDateTime, TimeZone};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::Path;
 
 const USAGE_MARKER: &[u8] = b"\"usage\"";
+
+/// Ceiling on one server log read into memory.
+///
+/// `server-logs/` accumulates every request and response the local server
+/// handled, including full prompt and completion bodies, and nothing rotates
+/// or truncates it -- a long-running server produces a single file that grows
+/// without bound. The parser only ever reads the `usage` objects out of it, so
+/// declining an oversized log costs the usage recorded in that one file and
+/// leaves every other log intact, which is the same outcome an unreadable file
+/// already produces here.
+///
+/// Sized to match the sibling parsers that made the same trade
+/// (`droid::MAX_TRANSCRIPT_BYTES`, `dsh::MAX_TRANSCRIPT_FILE_BYTES`).
+const MAX_SERVER_LOG_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Read a server log, refusing one past [`MAX_SERVER_LOG_BYTES`].
+///
+/// Reads one byte past the ceiling rather than trusting `metadata().len()`:
+/// the log is appended to while the scan runs, so a size checked before the
+/// read is a size that can grow before the read finishes.
+fn read_server_log_bounded(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() as u64 <= max_bytes).then_some(bytes)
+}
 
 #[derive(Debug, Default, Deserialize)]
 struct PromptTokenDetails {
@@ -271,7 +298,7 @@ fn fallback_dedup_key(path: &Path, marker: usize, model: &str, tokens: &TokenBre
 }
 
 pub fn parse_lmstudio_file(path: &Path) -> Vec<UnifiedMessage> {
-    let Ok(bytes) = std::fs::read(path) else {
+    let Some(bytes) = read_server_log_bounded(path, MAX_SERVER_LOG_BYTES) else {
         return Vec::new();
     };
     let fallback_timestamp = file_modified_timestamp_ms(path);
@@ -335,6 +362,36 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn reads_a_log_at_the_ceiling_and_refuses_one_past_it() {
+        let usage = br#"[2026-07-09 10:00:00][INFO][fixture-model]
+Final response: {"id":"chatcmpl-bound","model":"fixture-model","usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}
+"#;
+
+        let mut at_ceiling = NamedTempFile::new().unwrap();
+        at_ceiling.write_all(usage).unwrap();
+        at_ceiling.flush().unwrap();
+        let size = at_ceiling.as_file().metadata().unwrap().len();
+        assert_eq!(
+            read_server_log_bounded(at_ceiling.path(), size)
+                .as_deref()
+                .map(<[u8]>::len),
+            Some(usage.len()),
+            "a log exactly at the ceiling is still read"
+        );
+
+        assert!(
+            read_server_log_bounded(at_ceiling.path(), size - 1).is_none(),
+            "a log past the ceiling is refused rather than buffered"
+        );
+
+        // Refusing the read leaves the file contributing nothing, which is the
+        // same outcome an unreadable file already produces here.
+        assert!(parse_lmstudio_file(at_ceiling.path())
+            .first()
+            .is_some_and(|message| message.tokens.input == 10));
+    }
 
     #[test]
     fn parses_exact_components_and_marks_local_cost_authoritative() {
