@@ -2607,6 +2607,36 @@ fn parse_all_messages_streaming<S: MessageSink>(
         sessions::lmstudio::parse_lmstudio_file,
     );
 
+    // Unsloth Studio stores both internal chat usage and authenticated API
+    // receipts in a live SQLite database. Use the SQLite-aware fingerprint so
+    // WAL-only writes invalidate the cache, then dedupe configured overlapping
+    // roots by the stable message/request identities emitted by the parser.
+    let unsloth_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Unsloth)
+        .par_iter()
+        .map(|db_path| {
+            load_or_parse_sqlite_source(
+                message_cache::CacheIdentity::for_client(ClientId::Unsloth),
+                db_path,
+                &source_cache,
+                pricing,
+                sessions::unsloth::parse_unsloth_sqlite,
+            )
+        })
+        .collect();
+    let mut unsloth_seen = HashSet::new();
+    for outcome in unsloth_outcomes {
+        all_messages.extend(
+            outcome
+                .messages
+                .into_iter()
+                .filter(|message| should_keep_deduped_message(&mut unsloth_seen, message)),
+        );
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
     // ZCode (Z.ai GLM-5.2 ADE) JSONL sessions. Token usage may be embedded
     // from the API response; otherwise estimated from content.
     let zcode_messages: Vec<UnifiedMessage> = scan_result
@@ -5258,6 +5288,21 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     let lmstudio_count = summed_parsed_message_count(&lmstudio_msgs);
     counts.set(ClientId::LmStudio, lmstudio_count);
     messages.extend(lmstudio_msgs);
+
+    let unsloth_msgs_raw: Vec<UnifiedMessage> = scan_result
+        .get(ClientId::Unsloth)
+        .par_iter()
+        .flat_map(|path| sessions::unsloth::parse_unsloth_sqlite(path))
+        .collect();
+    let mut unsloth_seen: HashSet<String> = HashSet::new();
+    let unsloth_msgs: Vec<ParsedMessage> = unsloth_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut unsloth_seen, message))
+        .map(|message| unified_to_parsed(&message))
+        .collect();
+    let unsloth_count = summed_parsed_message_count(&unsloth_msgs);
+    counts.set(ClientId::Unsloth, unsloth_count);
+    messages.extend(unsloth_msgs);
 
     let mcode_msgs: Vec<ParsedMessage> = scan_result
         .get(ClientId::Mcode)
@@ -8053,6 +8098,133 @@ mod tests {
             Some(&pricing),
         );
         assert_eq!(warm, cold);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_unsloth_lane_reads_sqlite_and_invalidates_on_wal_changes() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let studio_root = source_home.path().join(".unsloth/studio");
+        std::fs::create_dir_all(&studio_root).unwrap();
+        let db_path = studio_root.join("studio.db");
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE chat_threads (
+                    id TEXT PRIMARY KEY,
+                    model_id TEXT
+                );
+                CREATE TABLE chat_messages (
+                    id TEXT PRIMARY KEY,
+                    thread_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    metadata_json TEXT,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE TABLE api_usage_events (
+                    id TEXT PRIMARY KEY,
+                    subject TEXT NOT NULL,
+                    endpoint TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    prompt_tokens INTEGER NOT NULL,
+                    completion_tokens INTEGER NOT NULL,
+                    total_tokens INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                INSERT INTO chat_threads (id, model_id)
+                VALUES ('thread-1', 'fixture-local-model');
+                INSERT INTO chat_messages (id, thread_id, role, metadata_json, created_at)
+                VALUES (
+                    'message-1',
+                    'thread-1',
+                    'assistant',
+                    '{"contextUsage":{"promptTokens":100,"completionTokens":40,"totalTokens":140,"cachedTokens":25,"modelId":"fixture-local-model"}}',
+                    1788000000
+                );
+                INSERT INTO api_usage_events (
+                    id, subject, endpoint, model, status,
+                    prompt_tokens, completion_tokens, total_tokens, created_at
+                ) VALUES (
+                    'request-1', 'private-user', '/v1/chat/completions',
+                    'fixture-local-model', 'completed', 8, 2, 10, 1788000100
+                );
+                "#,
+            )
+            .unwrap();
+        }
+
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "fixture-local-model".into(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(1.0),
+                output_cost_per_token: Some(1.0),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+        let clients = ["unsloth".to_string()];
+
+        let cold = parse_all_messages_with_pricing(
+            source_home.path().to_str().unwrap(),
+            &clients,
+            Some(&pricing),
+        );
+        assert_eq!(cold.len(), 2);
+        assert_eq!(
+            cold.iter()
+                .map(|message| message.tokens.total())
+                .sum::<i64>(),
+            150
+        );
+        assert!(cold
+            .iter()
+            .all(|message| message.cost == 0.0 && message.has_authoritative_cost()));
+
+        let warm = parse_all_messages_with_pricing(
+            source_home.path().to_str().unwrap(),
+            &clients,
+            Some(&pricing),
+        );
+        assert_eq!(warm, cold);
+
+        let writer = rusqlite::Connection::open(&db_path).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        writer.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        writer
+            .execute(
+                "INSERT INTO chat_messages (id, thread_id, role, metadata_json, created_at) VALUES (?1, ?2, 'assistant', ?3, ?4)",
+                rusqlite::params![
+                    "message-2",
+                    "thread-1",
+                    r#"{"contextUsage":{"promptTokens":9,"completionTokens":1,"totalTokens":10,"modelId":"fixture-local-model"}}"#,
+                    1_788_000_200_i64,
+                ],
+            )
+            .unwrap();
+        assert!(db_path.with_file_name("studio.db-wal").exists());
+
+        let refreshed = parse_all_messages_with_pricing(
+            source_home.path().to_str().unwrap(),
+            &clients,
+            Some(&pricing),
+        );
+        assert_eq!(refreshed.len(), 3);
+        assert_eq!(
+            refreshed
+                .iter()
+                .map(|message| message.tokens.total())
+                .sum::<i64>(),
+            160
+        );
+        assert!(refreshed
+            .iter()
+            .all(|message| message.cost == 0.0 && message.has_authoritative_cost()));
     }
 
     /// MiMo Code records carry an authoritative per-message cost. The micode

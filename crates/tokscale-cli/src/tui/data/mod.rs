@@ -1651,6 +1651,7 @@ mod tests {
         assert_eq!(clients[48], ClientId::Fx);
         assert_eq!(clients[49], ClientId::Omp);
         assert_eq!(clients[50], ClientId::LmStudio);
+        assert_eq!(clients[51], ClientId::Unsloth);
     }
 
     #[test]
@@ -1707,6 +1708,7 @@ mod tests {
             "Fx",
             "Oh My Pi",
             "LM Studio",
+            "Unsloth",
         ];
 
         assert_eq!(expected.len(), ClientId::COUNT);
@@ -1755,6 +1757,7 @@ mod tests {
         assert_eq!(crate::tui::client_ui::hotkey(ClientId::Fx), 'X');
         assert_eq!(crate::tui::client_ui::hotkey(ClientId::Omp), 'Y');
         assert_eq!(crate::tui::client_ui::hotkey(ClientId::LmStudio), 'L');
+        assert_eq!(crate::tui::client_ui::hotkey(ClientId::Unsloth), 'U');
     }
 
     #[test]

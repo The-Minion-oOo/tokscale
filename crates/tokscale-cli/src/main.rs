@@ -1096,6 +1096,7 @@ pub enum ClientFilter {
     Fx,
     Omp,
     LmStudio,
+    Unsloth,
     Synthetic,
 }
 
@@ -1157,6 +1158,7 @@ impl ClientFilter {
             Self::Fx => "fx",
             Self::Omp => "omp",
             Self::LmStudio => "lmstudio",
+            Self::Unsloth => "unsloth",
             Self::Synthetic => "synthetic",
         }
     }
@@ -1221,6 +1223,7 @@ impl ClientFilter {
             Self::Fx => Some(ClientId::Fx),
             Self::Omp => Some(ClientId::Omp),
             Self::LmStudio => Some(ClientId::LmStudio),
+            Self::Unsloth => Some(ClientId::Unsloth),
             Self::Synthetic => None,
         }
     }
@@ -1281,6 +1284,7 @@ impl ClientFilter {
             ClientId::Fx => Self::Fx,
             ClientId::Omp => Self::Omp,
             ClientId::LmStudio => Self::LmStudio,
+            ClientId::Unsloth => Self::Unsloth,
         }
     }
 

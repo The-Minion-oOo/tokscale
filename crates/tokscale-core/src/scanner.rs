@@ -548,6 +548,7 @@ pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
                 "session-usage.json" => file_name == "session-usage.json",
                 "chat-messages.json" => file_name == "chat-messages.json",
                 "workbuddy.db" => file_name == "workbuddy.db",
+                "studio.db" => file_name == "studio.db",
                 "sessions.db" => file_name == "sessions.db",
                 "state.db" => file_name == "state.db",
                 "threads.db" => file_name == "threads.db",
@@ -2751,6 +2752,56 @@ mod tests {
 
         assert_eq!(
             result.get(ClientId::LmStudio).as_slice(),
+            std::slice::from_ref(&expected)
+        );
+        assert_eq!(result.total_files(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_discovers_unsloth_database() {
+        let mut env = EnvGuard::capture(&["UNSLOTH_STUDIO_HOME"]);
+        env.remove("UNSLOTH_STUDIO_HOME");
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let studio_root = home.join(".unsloth/studio");
+        fs::create_dir_all(&studio_root).unwrap();
+        let expected = studio_root.join("studio.db");
+        File::create(&expected).unwrap();
+        File::create(studio_root.join("studio.db-wal")).unwrap();
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["unsloth".to_string()],
+            false,
+        );
+
+        assert_eq!(
+            result.get(ClientId::Unsloth).as_slice(),
+            std::slice::from_ref(&expected)
+        );
+        assert_eq!(result.total_files(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_honors_unsloth_studio_home() {
+        let dir = TempDir::new().unwrap();
+        let studio_root = dir.path().join("custom-studio");
+        fs::create_dir_all(&studio_root).unwrap();
+        let expected = studio_root.join("studio.db");
+        File::create(&expected).unwrap();
+        let mut env = EnvGuard::capture(&["UNSLOTH_STUDIO_HOME"]);
+        env.set("UNSLOTH_STUDIO_HOME", studio_root.to_str().unwrap());
+
+        let result = scan_all_clients_with_env_strategy(
+            dir.path().to_str().unwrap(),
+            &["unsloth".to_string()],
+            true,
+        );
+
+        assert_eq!(
+            result.get(ClientId::Unsloth).as_slice(),
             std::slice::from_ref(&expected)
         );
         assert_eq!(result.total_files(), 1);

@@ -62,6 +62,8 @@ pub const CLIENT_UI: [ClientUi; ClientId::COUNT] = [
     ClientUi { hotkey: 'Y' },
     // LM Studio: uppercase `L` stays mnemonic while lowercase `l` belongs to Kilo.
     ClientUi { hotkey: 'L' },
+    // Unsloth: uppercase `U` stays mnemonic while lowercase `u` belongs to Grok Build.
+    ClientUi { hotkey: 'U' },
 ];
 
 pub fn display_name(client: ClientId) -> &'static str {

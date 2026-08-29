@@ -1021,6 +1021,24 @@ define_clients!(
         headless: false,
         parse_local: true,
         submit_default: true
+    },
+    // Unsloth Studio persists exact inference usage in a single SQLite
+    // database. Internal chats store scalar usage in assistant-message
+    // metadata, while authenticated external API calls are copied into a
+    // content-free usage table. Training throughput is intentionally separate.
+    Unsloth = 51 => {
+        id: "unsloth",
+        display: "Unsloth",
+        logo: Some("https://github.com/unslothai.png"),
+        root: PathRoot::EnvVar {
+            var: "UNSLOTH_STUDIO_HOME",
+            fallback_relative: ".unsloth/studio",
+        },
+        relative: "studio.db",
+        pattern: "studio.db",
+        headless: false,
+        parse_local: true,
+        submit_default: true
     }
 );
 
@@ -1136,7 +1154,7 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 51);
+        assert_eq!(ClientId::COUNT, 52);
     }
 
     #[test]
@@ -1762,6 +1780,32 @@ mod tests {
         assert!(client.data().parse_local);
         assert!(client.data().submit_default);
         assert!(!client.data().headless);
+    }
+
+    #[test]
+    #[serial]
+    fn test_unsloth_client_registered_with_studio_home_override() {
+        let mut env = EnvGuard::capture(&["UNSLOTH_STUDIO_HOME"]);
+        env.set("UNSLOTH_STUDIO_HOME", "/custom/unsloth-studio");
+
+        let client = ClientId::from_str("unsloth").expect("Unsloth should be registered");
+        assert_eq!(client, ClientId::Unsloth);
+        assert_eq!(client.display_name(), "Unsloth");
+        assert_eq!(client.data().relative_path, "studio.db");
+        assert_eq!(client.data().pattern, "studio.db");
+        assert_eq!(
+            client.data().resolve_path("/tmp/home"),
+            native_join(std::path::Path::new("/custom/unsloth-studio"), "studio.db")
+        );
+        assert_eq!(
+            client
+                .data()
+                .resolve_path_with_env_strategy("/tmp/home", false),
+            native_join(
+                std::path::Path::new("/tmp/home"),
+                ".unsloth/studio/studio.db"
+            )
+        );
     }
 
     #[test]

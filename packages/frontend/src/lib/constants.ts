@@ -80,6 +80,7 @@ export const SOURCE_DISPLAY_NAMES: Record<ClientType, string> = {
   fx: "Fx",
   omp: "Oh My Pi",
   lmstudio: "LM Studio",
+  unsloth: "Unsloth",
 };
 
 // Client logos from GitHub CDN (public repo)
@@ -143,6 +144,7 @@ export const SOURCE_LOGOS: Record<ClientType, string> = {
   fx: `${GITHUB_CDN_BASE}/client-fx.png`,
   omp: "https://github.com/can1357.png",
   lmstudio: "https://github.com/lmstudio-ai.png",
+  unsloth: "https://github.com/unslothai.png",
 };
 
 export const SOURCE_COLORS: Record<ClientType, string> = {
@@ -199,6 +201,7 @@ export const SOURCE_COLORS: Record<ClientType, string> = {
   fx: "#0070F3",
   omp: "#E11D48",
   lmstudio: "#6C5CE7",
+  unsloth: "#58CC02",
 };
 
 // Derived values
